@@ -1,6 +1,7 @@
 
-# LoConv orchestrator runtime
+# Local Orkestra state and Python environment
 .loconv/
+.venv/
 
 # Converter build output and generated synthetic media
 /target/
