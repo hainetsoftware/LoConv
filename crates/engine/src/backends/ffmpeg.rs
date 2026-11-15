@@ -1,4 +1,4 @@
-//! Trusted, fixed audio commands and bounded FFprobe execution.
+//! Trusted, fixed media commands and bounded FFprobe execution.
 #[path = "ffmpeg_audio.rs"]
 mod audio;
 #[cfg(unix)]
@@ -13,7 +13,7 @@ use loconv_contracts::{MediaKind, StreamInfo};
 use sha2::{Digest, Sha256};
 use std::{
     fs::File,
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -155,7 +155,7 @@ impl TrustedProbe {
         })
     }
 
-    pub(crate) fn inspect(&self, file: File, demuxer: &'static str) -> EngineResult<AudioDetails> {
+    pub(crate) fn inspect(&self, file: File, demuxer: &'static str) -> EngineResult<ProbeDetails> {
         self.inspect_cancellable(file, demuxer, None)
     }
 
@@ -164,7 +164,7 @@ impl TrustedProbe {
         file: File,
         demuxer: &'static str,
         cancel: Option<&AtomicBool>,
-    ) -> EngineResult<AudioDetails> {
+    ) -> EngineResult<ProbeDetails> {
         Self::verified(&self.path, &self.digest)?;
         // Discover enabled demuxers from this executable instead of assuming a build.
         let caps = run_cancellable(
@@ -178,7 +178,10 @@ impl TrustedProbe {
         )?;
         if !String::from_utf8_lossy(&caps).lines().any(|line| {
             let mut cols = line.split_whitespace();
-            cols.next().is_some_and(|flag| flag.contains('D')) && cols.next() == Some(demuxer)
+            cols.next().is_some_and(|flag| flag.contains('D'))
+                && cols
+                    .next()
+                    .is_some_and(|names| names.split(',').any(|name| name == demuxer))
         }) {
             return Err(errors::tool_unavailable());
         }
@@ -195,11 +198,43 @@ impl TrustedProbe {
     }
 }
 
+fn video_demuxer(demuxer: &str) -> bool {
+    matches!(demuxer, "mov" | "matroska")
+}
+
+fn input_args(demuxer: &str) -> Vec<&str> {
+    let protocol = if video_demuxer(demuxer) { "fd" } else { "pipe" };
+    let mut args = vec![
+        "-protocol_whitelist",
+        protocol,
+        "-format_whitelist",
+        demuxer,
+        "-f",
+        demuxer,
+        "-probesize",
+        "1048576",
+        "-analyzeduration",
+        "5000000",
+        "-threads",
+        "1",
+    ];
+    if demuxer == "mov" {
+        args.extend(["-enable_drefs", "0", "-use_absolute_path", "0"]);
+    }
+    if video_demuxer(demuxer) {
+        args.extend(["-fd", "0", "-i", "fd:"]);
+    } else {
+        args.extend(["-i", "pipe:0"]);
+    }
+    args
+}
+
 fn probe_args(demuxer: &str) -> Vec<&str> {
-    vec!["-v", "error", "-max_alloc", "67108864", "-protocol_whitelist", "pipe", "-format_whitelist", demuxer,
-        "-f", demuxer, "-probesize", "1048576", "-analyzeduration", "5000000", "-threads", "1",
-        "-show_entries", "format=format_name,duration:stream=index,codec_type,codec_name,sample_rate,channels:stream_disposition=attached_pic",
-        "-of", "json", "-i", "pipe:0"]
+    let mut args = vec!["-v", "error", "-max_alloc", "67108864",
+        "-show_entries", "format=format_name,duration:stream=index,codec_type,codec_name,width,height,sample_rate,channels:stream_disposition=attached_pic",
+        "-of", "json"];
+    args.extend(input_args(demuxer));
+    args
 }
 
 fn read_bounded(
@@ -253,10 +288,16 @@ fn run_cancellable(
     cancel: Option<&AtomicBool>,
 ) -> EngineResult<Vec<u8>> {
     let mut command = Command::new(path);
+    let seekable = args.contains(&"fd:");
+    let (stdio, input) = if seekable {
+        (Stdio::from(input.ok_or_else(errors::internal)?), None)
+    } else {
+        (Stdio::piped(), input)
+    };
     command
         .args(args)
         .env_clear()
-        .stdin(Stdio::piped())
+        .stdin(stdio)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]
@@ -265,13 +306,12 @@ fn run_cancellable(
         command.process_group(0);
     }
     let mut child = command.spawn().map_err(|_| errors::tool_unavailable())?;
-    let mut stdin = child.stdin.take().ok_or_else(errors::internal)?;
+    let stdin = child.stdin.take();
     let writer = std::thread::spawn(move || {
-        if let Some(file) = input {
+        if let (Some(file), Some(mut stdin)) = (input, stdin) {
             let mut bounded = file.take(crate::backends::image::MAX_DECODED_ALLOCATION_BYTES);
             let _ = std::io::copy(&mut bounded, &mut stdin);
         }
-        let _ = stdin.flush();
     });
     let exceeded = Arc::new(AtomicBool::new(false));
     let stdout = child.stdout.take().ok_or_else(errors::internal)?;
@@ -324,21 +364,26 @@ fn run_cancellable(
     stdout
 }
 
-pub(crate) struct AudioDetails {
+pub(crate) struct ProbeDetails {
     pub container: String,
     pub duration_ms: Option<f64>,
     pub streams: Vec<StreamInfo>,
 }
 
-fn normalize(bytes: &[u8], expected: &str) -> EngineResult<AudioDetails> {
+fn normalize(bytes: &[u8], expected: &str) -> EngineResult<ProbeDetails> {
     if bytes.len() > MAX_PROBE_STDOUT_BYTES {
         return Err(errors::resource_limit());
     }
     let root: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|_| errors::inspection_failed())?;
     let format = root.get("format").ok_or_else(errors::inspection_failed)?;
-    if !matches!(expected, "wav" | "flac" | "mp3" | "ogg")
-        || format["format_name"].as_str() != Some(expected)
+    let video = video_demuxer(expected);
+    if !matches!(
+        expected,
+        "wav" | "flac" | "mp3" | "ogg" | "mov" | "matroska"
+    ) || !format["format_name"]
+        .as_str()
+        .is_some_and(|names| names.split(',').any(|name| name == expected))
     {
         return Err(errors::unsupported_input());
     }
@@ -356,25 +401,35 @@ fn normalize(bytes: &[u8], expected: &str) -> EngineResult<AudioDetails> {
         if kind == "video" && stream["disposition"]["attached_pic"].as_u64() == Some(1) {
             continue;
         }
-        if kind != "audio" {
+        if video && matches!(kind, "subtitle" | "data" | "attachment") {
+            continue;
+        }
+        if kind != "audio" && !(video && kind == "video") {
             return Err(errors::unsupported_input());
         }
         let codec = stream["codec_name"]
             .as_str()
             .ok_or_else(errors::inspection_failed)?;
-        if !matches!(
-            codec,
-            "mp3"
-                | "flac"
-                | "vorbis"
-                | "opus"
-                | "pcm_s16le"
-                | "pcm_s24le"
-                | "pcm_s32le"
-                | "pcm_u8"
-                | "pcm_f32le"
-                | "pcm_f64le"
-        ) {
+        let permitted = if kind == "video" {
+            matches!(codec, "h264" | "hevc" | "mpeg4" | "vp8" | "vp9" | "av1")
+        } else if video {
+            matches!(codec, "aac" | "opus" | "vorbis" | "mp3")
+        } else {
+            matches!(
+                codec,
+                "mp3"
+                    | "flac"
+                    | "vorbis"
+                    | "opus"
+                    | "pcm_s16le"
+                    | "pcm_s24le"
+                    | "pcm_s32le"
+                    | "pcm_u8"
+                    | "pcm_f32le"
+                    | "pcm_f64le"
+            )
+        };
+        if !permitted {
             return Err(errors::unsupported_input());
         }
         let index = stream["index"]
@@ -392,17 +447,38 @@ fn normalize(bytes: &[u8], expected: &str) -> EngineResult<AudioDetails> {
             .as_u64()
             .filter(|v| *v > 0 && *v <= 64)
             .map(|v| v as u32);
+        let (kind, width, height) = if kind == "video" {
+            let dimension = |name| {
+                stream
+                    .get(name)
+                    .and_then(|v| v.as_u64())
+                    .filter(|v| (1..=4096).contains(v))
+            };
+            let width = dimension("width").ok_or_else(errors::resource_limit)?;
+            let height = dimension("height").ok_or_else(errors::resource_limit)?;
+            if width * height > 3840 * 2160 {
+                return Err(errors::resource_limit());
+            }
+            (MediaKind::Video, Some(width as u32), Some(height as u32))
+        } else {
+            (MediaKind::Audio, None, None)
+        };
         normalized.push(StreamInfo {
             index,
-            kind: MediaKind::Audio,
+            kind,
             codec: codec.to_owned(),
-            width: None,
-            height: None,
+            width,
+            height,
             sample_rate_hz: rate,
             channels,
         });
     }
-    if normalized.is_empty() {
+    if normalized.is_empty()
+        || (video
+            && !normalized
+                .iter()
+                .any(|stream| stream.kind == MediaKind::Video))
+    {
         return Err(errors::unsupported_input());
     }
     let duration_ms = format["duration"]
@@ -410,7 +486,7 @@ fn normalize(bytes: &[u8], expected: &str) -> EngineResult<AudioDetails> {
         .and_then(|s| s.parse::<f64>().ok())
         .map(|v| v * 1000.0)
         .filter(|v| v.is_finite() && *v >= 0.0);
-    Ok(AudioDetails {
+    Ok(ProbeDetails {
         container: expected.to_owned(),
         duration_ms,
         streams: normalized,
@@ -422,12 +498,13 @@ mod tests {
     use super::*;
     use loconv_contracts::ErrorCode;
     use serde_json::json;
+    use std::io::Write;
 
     fn response() -> serde_json::Value {
         json!({"format":{"format_name":"wav","duration":"1.25","tags":{"title":"PRIVATE / invented"}},
             "streams":[{"index":0,"codec_type":"audio","codec_name":"pcm_s16le","sample_rate":"48000","channels":2,"tags":{"secret":"PRIVATE"}}]})
     }
-    fn parse(value: &serde_json::Value) -> EngineResult<AudioDetails> {
+    fn parse(value: &serde_json::Value) -> EngineResult<ProbeDetails> {
         normalize(&serde_json::to_vec(value).unwrap(), "wav")
     }
     #[test]

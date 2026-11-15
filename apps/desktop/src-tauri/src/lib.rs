@@ -203,7 +203,7 @@ fn trigger_queue_worker<R: tauri::Runtime>(state: &NativeState, app: tauri::AppH
                     .map_err(|_| errors::conversion_failed())?;
                 worker_owned.store(true, Ordering::SeqCst);
                 let verification = output.try_clone().map_err(|_| errors::internal())?;
-                if input.inspection.kind == MediaKind::Audio {
+                if matches!(input.inspection.kind, MediaKind::Audio | MediaKind::Video) {
                     let encoder = encoder.ok_or_else(errors::tool_unavailable)?;
                     let probe = probe.ok_or_else(errors::tool_unavailable)?;
                     encoder.convert_to_file(

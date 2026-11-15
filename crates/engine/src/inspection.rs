@@ -109,6 +109,10 @@ pub fn inspect_local_file_with_probe(
         Some("flac")
     } else if sig.starts_with(b"OggS") {
         Some("ogg")
+    } else if sig.get(4..8) == Some(b"ftyp") {
+        Some("mov")
+    } else if sig.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
+        Some("matroska")
     } else if sig.starts_with(b"ID3") || (n >= 2 && sig[0] == 0xff && sig[1] & 0xe0 == 0xe0) {
         Some("mp3")
     } else {
@@ -125,7 +129,15 @@ pub fn inspect_local_file_with_probe(
                 .and_then(|s| s.to_str())
                 .unwrap_or("audio")
                 .to_owned(),
-            kind: MediaKind::Audio,
+            kind: if details
+                .streams
+                .iter()
+                .any(|stream| stream.kind == MediaKind::Video)
+            {
+                MediaKind::Video
+            } else {
+                MediaKind::Audio
+            },
             size_bytes: len.to_string(),
             duration_ms: details.duration_ms,
             container: details.container,

@@ -9,6 +9,8 @@ use std::{
 pub(super) struct Capabilities {
     mp3: bool,
     wav: bool,
+    mp4: bool,
+    webm: bool,
     demuxers: Vec<String>,
 }
 
@@ -42,10 +44,23 @@ pub(super) fn discover(tool: &TrustedProbe) -> EngineResult<Capabilities> {
         && input_protocols.lines().any(|v| v.trim() == "pipe")
         && has(&muxers, "null", 'E')
         && has(&encoders, "pcm_s16le", 'A');
+    let video = common
+        && input_protocols.lines().any(|v| v.trim() == "fd")
+        && has(&encoders, "wrapped_avframe", 'V');
     Ok(Capabilities {
+        mp4: video
+            && has(&encoders, "libx264", 'V')
+            && has(&encoders, "aac", 'A')
+            && has(&muxers, "mp4", 'E')
+            && has(&demuxers, "mov", 'D'),
+        webm: video
+            && has(&encoders, "libvpx-vp9", 'V')
+            && has(&encoders, "libopus", 'A')
+            && has(&muxers, "webm", 'E')
+            && has(&demuxers, "matroska", 'D'),
         mp3: common && has(&encoders, "libmp3lame", 'A') && has(&muxers, "mp3", 'E'),
         wav: common && has(&encoders, "pcm_s16le", 'A') && has(&muxers, "wav", 'E'),
-        demuxers: ["wav", "mp3", "flac", "ogg"]
+        demuxers: ["wav", "mp3", "flac", "ogg", "mov", "matroska"]
             .into_iter()
             .filter(|d| has(&demuxers, d, 'D'))
             .map(str::to_owned)
@@ -67,18 +82,20 @@ impl TrustedFfmpeg {
         match format {
             FormatId::Mp3 => self.capabilities.mp3,
             FormatId::WavPcm16 => self.capabilities.wav,
+            FormatId::Mp4H264Aac => self.capabilities.mp4,
+            FormatId::WebmVp9Opus => self.capabilities.webm,
             _ => false,
         }
     }
 
     pub fn supports_input(&self, format: &FormatId, input: &InputInspection) -> bool {
         self.supports(format)
-            && input.kind == MediaKind::Audio
+            && input.kind == input_kind(format)
             && self.capabilities.demuxers.contains(&input.container)
             && input
                 .streams
                 .iter()
-                .any(|stream| stream.kind == MediaKind::Audio)
+                .any(|stream| stream.kind == input_kind(format))
     }
 
     pub fn convert(
@@ -120,27 +137,33 @@ impl TrustedFfmpeg {
         } = request;
         // Rehash immediately before execution; capabilities belong to these exact bytes.
         TrustedProbe::verified(&self.executable.path, &self.executable.digest)?;
-        let caps = &self.capabilities;
-        let ready = match format {
-            FormatId::Mp3 => caps.mp3,
-            FormatId::WavPcm16 => caps.wav,
-            _ => false,
-        };
-        if !ready
-            || inspection.kind != MediaKind::Audio
-            || !caps.demuxers.contains(&inspection.container)
-        {
+        if !self.supports_input(format, inspection) {
             return Err(errors::tool_unavailable());
         }
+        let kind = input_kind(format);
         let stream = inspection
             .streams
             .iter()
-            .find(|s| s.kind == MediaKind::Audio)
+            .find(|s| s.kind == kind)
             .ok_or_else(errors::unsupported_input)?;
+        let video = kind == MediaKind::Video;
+        let audio = inspection
+            .streams
+            .iter()
+            .find(|s| s.kind == MediaKind::Audio);
         if cancel.load(Ordering::SeqCst) {
             return Err(errors::conversion_failed());
         }
-        let args = encode_args(&inspection.container, stream.index, format);
+        let args = if video {
+            video_args(
+                &inspection.container,
+                stream.index,
+                audio.map(|s| s.index),
+                format,
+            )
+        } else {
+            encode_args(&inspection.container, stream.index, format)
+        };
         supervise(
             &self.executable.path,
             &args,
@@ -159,10 +182,12 @@ impl TrustedFfmpeg {
         {
             return Err(errors::conversion_failed());
         }
-        let muxer = if *format == FormatId::Mp3 {
-            "mp3"
-        } else {
-            "wav"
+        let (demuxer, codec, audio_codec) = match format {
+            FormatId::Mp3 => ("mp3", "mp3", None),
+            FormatId::WavPcm16 => ("wav", "pcm_s16le", None),
+            FormatId::Mp4H264Aac => ("mov", "h264", audio.map(|_| "aac")),
+            FormatId::WebmVp9Opus => ("matroska", "vp9", audio.map(|_| "opus")),
+            _ => return Err(errors::unsupported_input()),
         };
         use std::io::Seek;
         owned
@@ -172,15 +197,19 @@ impl TrustedFfmpeg {
             .map_err(|_| errors::internal())?;
         let details = probe.inspect_cancellable(
             owned.try_clone().map_err(|_| errors::internal())?,
-            muxer,
+            demuxer,
             Some(cancel),
         )?;
-        let codec = if *format == FormatId::Mp3 {
-            "mp3"
-        } else {
-            "pcm_s16le"
-        };
-        if details.streams.len() != 1 || details.streams[0].codec != codec {
+        let primary = details.streams.iter().filter(|s| s.kind == kind);
+        if details.streams.len() != 1 + usize::from(audio_codec.is_some())
+            || !primary.map(|s| s.codec.as_str()).eq([codec])
+            || audio_codec.is_some_and(|expected| {
+                !details
+                    .streams
+                    .iter()
+                    .any(|s| s.kind == MediaKind::Audio && s.codec == expected)
+            })
+        {
             return Err(errors::conversion_failed());
         }
         // Decode the complete result with strict error handling before publication.
@@ -189,27 +218,27 @@ impl TrustedFfmpeg {
         verification
             .seek(SeekFrom::Start(0))
             .map_err(|_| errors::internal())?;
-        let args = vec![
-            "-v".into(),
-            "error".into(),
-            "-xerror".into(),
-            "-protocol_whitelist".into(),
-            "pipe".into(),
-            "-format_whitelist".into(),
-            muxer.into(),
-            "-f".into(),
-            muxer.into(),
-            "-i".into(),
-            "pipe:0".into(),
-            "-map".into(),
-            "0:a:0".into(),
-            "-f".into(),
-            "null".into(),
-            "-progress".into(),
-            "pipe:1".into(),
-            "-nostats".into(),
-            "pipe:3".into(),
-        ];
+        let mut args: Vec<String> = ["-v", "error", "-xerror", "-max_alloc", "67108864"]
+            .into_iter()
+            .chain(input_args(demuxer))
+            .map(str::to_owned)
+            .collect();
+        args.extend(
+            [
+                "-map",
+                "0",
+                "-threads",
+                "1",
+                "-f",
+                "null",
+                "-progress",
+                "pipe:1",
+                "-nostats",
+                "pipe:3",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
         // null muxer writes no bytes; use the same already owned descriptor.
         let decoded_us = supervise(
             &self.executable.path,
@@ -225,6 +254,101 @@ impl TrustedFfmpeg {
         }
         Ok(())
     }
+}
+
+fn input_kind(format: &FormatId) -> MediaKind {
+    match format {
+        FormatId::Mp4H264Aac | FormatId::WebmVp9Opus => MediaKind::Video,
+        _ => MediaKind::Audio,
+    }
+}
+
+fn video_args(demuxer: &str, video: u32, audio: Option<u32>, format: &FormatId) -> Vec<String> {
+    let (encoder, audio_encoder, muxer, quality) = if *format == FormatId::Mp4H264Aac {
+        ("libx264", "aac", "mp4", "23")
+    } else {
+        ("libvpx-vp9", "libopus", "webm", "32")
+    };
+    let mut args: Vec<String> = [
+        "-v",
+        "error",
+        "-nostdin",
+        "-xerror",
+        "-max_alloc",
+        "67108864",
+        "-max_pixels",
+        "16777216",
+    ]
+    .into_iter()
+    .chain(input_args(demuxer))
+    .map(str::to_owned)
+    .collect();
+    args.extend(["-map".to_owned(), format!("0:{video}")]);
+    if let Some(index) = audio {
+        args.extend(["-map".to_owned(), format!("0:{index}")]);
+        args.extend(
+            [
+                "-c:a",
+                audio_encoder,
+                "-b:a",
+                "128k",
+                "-ac",
+                "2",
+                "-ar",
+                "48000",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+    }
+    args.extend(
+        [
+            "-sn",
+            "-dn",
+            "-map_metadata",
+            "-1",
+            "-map_metadata:s",
+            "-1",
+            "-map_chapters",
+            "-1",
+            "-vf",
+            "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            encoder,
+            "-crf",
+            quality,
+            "-threads",
+            "1",
+        ]
+        .into_iter()
+        .map(str::to_owned),
+    );
+    if muxer == "webm" {
+        args.extend(["-b:v".to_owned(), "0".to_owned()]);
+    }
+    args.extend(
+        [
+            "-fflags",
+            "+bitexact",
+            "-progress",
+            "pipe:1",
+            "-stats_period",
+            "0.25",
+            "-nostats",
+            "-f",
+            muxer,
+            "-protocol_whitelist",
+            "fd",
+            "-fd",
+            "3",
+            "fd:",
+        ]
+        .into_iter()
+        .map(str::to_owned),
+    );
+    args
 }
 
 fn encode_args(demuxer: &str, stream: u32, format: &FormatId) -> Vec<String> {
@@ -483,6 +607,7 @@ fn supervise(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     #[test]
     fn capabilities_require_exact_encoder_and_muxer_names() {
         assert!(has(b" A....D libmp3lame description\n", "libmp3lame", 'A'));
@@ -498,8 +623,7 @@ mod tests {
             },
             capabilities: Capabilities {
                 mp3: true,
-                wav: false,
-                demuxers: vec![],
+                ..Capabilities::default()
             },
         };
         assert!(tool.supports(&FormatId::Mp3));
@@ -707,6 +831,115 @@ mod tests {
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
         crate::paths::cleanup_temp(&path).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[cfg(all(debug_assertions, feature = "dev-tools", target_os = "macos"))]
+    #[test]
+    #[ignore = "requires hash-pinned development binaries and video encoders"]
+    fn real_video_matrix() {
+        let resources = Path::new("/unused-resource-root");
+        let tool = TrustedFfmpeg::resolve(resources).unwrap();
+        let probe = TrustedProbe::resolve(resources).unwrap();
+        let dir = std::env::temp_dir().join(format!("loconv-real-video-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let input = dir.join("synthetic.mp4");
+        // Default MP4 layout has a trailing moov atom and requires seekable input.
+        let generated = Command::new(&tool.executable.path)
+            .env_clear()
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=96x64:rate=12",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000",
+                "-t",
+                "3",
+                "-c:v",
+                "libx264",
+                "-threads",
+                "1",
+                "-c:a",
+                "aac",
+                "-metadata",
+                "title=SYNTHETIC-PRIVATE",
+            ])
+            .arg(&input)
+            .output()
+            .unwrap();
+        assert!(generated.status.success(), "fixture generation");
+        let before = std::fs::read(&input).unwrap();
+        let cancel = AtomicBool::new(false);
+        let encode = |source: &Path, target: &Path, format| {
+            let inspected = crate::inspection::inspect_local_file_with_probe(source, Some(&probe))
+                .expect("inspect source");
+            assert_eq!(inspected.kind, MediaKind::Video);
+            assert!(inspected.duration_ms.is_some());
+            assert!(tool.supports_input(&format, &inspected));
+            tool.convert(
+                AudioRequest {
+                    input: File::open(source).unwrap(),
+                    output: target,
+                    inspection: &inspected,
+                    format: &format,
+                    probe: &probe,
+                    cancel: &cancel,
+                },
+                |_| {},
+            )
+            .expect("encode and verify");
+            assert!(!std::fs::read(target)
+                .unwrap()
+                .windows(b"SYNTHETIC-PRIVATE".len())
+                .any(|bytes| bytes == b"SYNTHETIC-PRIVATE"));
+        };
+        let webm = dir.join("encoded.webm");
+        let mp4 = dir.join("encoded.mp4");
+        encode(&input, &webm, FormatId::WebmVp9Opus);
+        encode(&webm, &mp4, FormatId::Mp4H264Aac);
+        encode(&webm, &dir.join("same.webm"), FormatId::WebmVp9Opus);
+        encode(&input, &dir.join("same.mp4"), FormatId::Mp4H264Aac);
+        assert_eq!(std::fs::read(&input).unwrap(), before);
+
+        let inspected =
+            crate::inspection::inspect_local_file_with_probe(&input, Some(&probe)).unwrap();
+        let mut args = video_args(&inspected.container, 0, Some(1), &FormatId::WebmVp9Opus);
+        let input_option = args.iter().position(|arg| arg == "-i").unwrap();
+        args.splice(
+            input_option..input_option,
+            ["-readrate", "0.1"].map(str::to_owned),
+        );
+        let partial = dir.join("cancelled.webm");
+        let owned = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&partial)
+            .unwrap();
+        let cancelled = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(100));
+                cancel.store(true, Ordering::SeqCst);
+            });
+            supervise(
+                &tool.executable.path,
+                &args,
+                File::open(&input).unwrap(),
+                &owned,
+                &cancel,
+                inspected.duration_ms,
+                &mut |_| {},
+            )
+        });
+        assert!(cancelled.is_err());
+        drop(owned);
+        crate::paths::cleanup_temp(&partial).unwrap();
+        assert!(!partial.exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(all(debug_assertions, feature = "dev-tools", target_os = "macos"))]
