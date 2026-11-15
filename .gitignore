@@ -1,3 +1,13 @@
 
 # LoConv orchestrator runtime
 .loconv/
+
+# Converter build output and generated synthetic media
+/target/
+**/node_modules/
+/apps/desktop/dist/
+/tests/generated/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store

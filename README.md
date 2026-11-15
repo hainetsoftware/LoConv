@@ -1,5 +1,15 @@
 # LoConv Orchestrator v0.1
 
+## Converter architecture foundation
+
+This repository currently contains the development orchestrator below and a
+Sprint 1 converter foundation, not a runnable media converter. Start with
+[ARCHITECTURE.md](ARCHITECTURE.md), [SPRINT_PLAN.md](SPRINT_PLAN.md) and
+[PRIVACY.md](PRIVACY.md). Shared IPC types live in `crates/contracts` and
+`apps/desktop/src/api/contracts.ts`. Run `cargo test --workspace --offline` for
+contract checks when Rust dependencies are cached. The planned converter uses
+Tauri 2, React/TypeScript/Vite, Rust, bundled FFmpeg/FFprobe and Rust image codecs.
+
 A **local Textual TUI** for coordinating four coding CLIs in isolated Git worktrees. Designed to bootstrap the **LoConv** offline media converter project.
 
 ## Get started on your Mac
@@ -47,9 +57,10 @@ On first launch, `.loconv/agents.json` is created. Every agent must have an arra
 
 Configuration is reloaded on application startup. You must authenticate each CLI separately before running non-interactive tasks.
 
-### Suggested first sprint
+### Earlier bootstrap example (superseded)
 
-Assign two independent tasks concurrently:
+Use SPRINT_PLAN.md for current agent ownership and contracts. The following was
+the earlier bootstrap suggestion, before the shared architecture was established:
 
 **Codex**: “Initialize the Tauri 2 + Rust backend and implement local FFprobe media inspection with tests. Do not modify the React frontend.”
 
