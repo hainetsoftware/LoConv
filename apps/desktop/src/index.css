@@ -1,0 +1,163 @@
+:root {
+  --font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+
+  /* macOS Light Theme */
+  --bg-app: #f5f5f7;
+  --bg-sidebar: #ebebed;
+  --bg-surface: #ffffff;
+  --bg-surface-hover: #f0f0f4;
+  --bg-surface-active: #e4e4e9;
+  --bg-inset: #e8e8ed;
+
+  --text-primary: #1d1d1f;
+  --text-secondary: #6e6e73;
+  --text-tertiary: #86868b;
+  --text-inverse: #ffffff;
+
+  --border-subtle: rgba(0, 0, 0, 0.08);
+  --border-strong: rgba(0, 0, 0, 0.16);
+
+  --accent-color: #0071e3;
+  --accent-hover: #0077ed;
+  --accent-active: #0062c4;
+  --accent-subtle: rgba(0, 113, 227, 0.12);
+
+  --success-color: #28cd41;
+  --success-subtle: rgba(40, 205, 65, 0.15);
+  --warning-color: #ff9f0a;
+  --warning-subtle: rgba(255, 159, 10, 0.15);
+  --danger-color: #ff3b30;
+  --danger-subtle: rgba(255, 59, 48, 0.15);
+
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.08);
+  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.12);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg-app: #1e1e1e;
+    --bg-sidebar: #252528;
+    --bg-surface: #2c2c2e;
+    --bg-surface-hover: #353538;
+    --bg-surface-active: #3e3e42;
+    --bg-inset: #1a1a1c;
+
+    --text-primary: #f5f5f7;
+    --text-secondary: #a1a1a6;
+    --text-tertiary: #86868b;
+    --text-inverse: #ffffff;
+
+    --border-subtle: rgba(255, 255, 255, 0.1);
+    --border-strong: rgba(255, 255, 255, 0.2);
+
+    --accent-color: #2997ff;
+    --accent-hover: #40a9ff;
+    --accent-active: #1480e6;
+    --accent-subtle: rgba(41, 151, 255, 0.2);
+
+    --success-color: #32d74b;
+    --success-subtle: rgba(50, 215, 75, 0.2);
+    --warning-color: #ffd60a;
+    --warning-subtle: rgba(255, 214, 10, 0.2);
+    --danger-color: #ff453a;
+    --danger-subtle: rgba(255, 69, 58, 0.2);
+
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.25);
+    --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.35);
+    --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.5);
+  }
+}
+
+[data-theme="light"] {
+  --bg-app: #f5f5f7;
+  --bg-sidebar: #ebebed;
+  --bg-surface: #ffffff;
+  --bg-surface-hover: #f0f0f4;
+  --bg-surface-active: #e4e4e9;
+  --bg-inset: #e8e8ed;
+
+  --text-primary: #1d1d1f;
+  --text-secondary: #6e6e73;
+  --text-tertiary: #86868b;
+
+  --border-subtle: rgba(0, 0, 0, 0.08);
+  --border-strong: rgba(0, 0, 0, 0.16);
+
+  --accent-color: #0071e3;
+  --accent-hover: #0077ed;
+  --accent-active: #0062c4;
+  --accent-subtle: rgba(0, 113, 227, 0.12);
+}
+
+[data-theme="dark"] {
+  --bg-app: #1e1e1e;
+  --bg-sidebar: #252528;
+  --bg-surface: #2c2c2e;
+  --bg-surface-hover: #353538;
+  --bg-surface-active: #3e3e42;
+  --bg-inset: #1a1a1c;
+
+  --text-primary: #f5f5f7;
+  --text-secondary: #a1a1a6;
+  --text-tertiary: #86868b;
+
+  --border-subtle: rgba(255, 255, 255, 0.1);
+  --border-strong: rgba(255, 255, 255, 0.2);
+
+  --accent-color: #2997ff;
+  --accent-hover: #40a9ff;
+  --accent-active: #1480e6;
+  --accent-subtle: rgba(41, 151, 255, 0.2);
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: var(--font-family);
+  background-color: var(--bg-app);
+  color: var(--text-primary);
+  font-size: 13px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  user-select: none;
+  overflow: hidden;
+  height: 100vh;
+  width: 100vw;
+}
+
+button {
+  font-family: inherit;
+  font-size: 13px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  outline: none;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--accent-color);
+  outline-offset: 1px;
+}
+
+input, select {
+  font-family: inherit;
+  font-size: 13px;
+  color: var(--text-primary);
+  background-color: var(--bg-surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+}
