@@ -592,6 +592,61 @@ fn rejects_animated_and_oversized_images() {
     webp_data.extend_from_slice(&[0; 6]);
     std::fs::write(&webp_path, &webp_data).unwrap();
 
+    // 3. Synthetic oversized PNG (> 100 megapixels)
+    let oversized_path = temp_dir.join("oversized.png");
+    let mut oversized_data = Vec::new();
+    oversized_data.extend_from_slice(&[137, 80, 78, 71, 13, 10, 26, 10]); // signature
+    oversized_data.extend_from_slice(&13u32.to_be_bytes()); // IHDR length = 13
+    let mut ihdr_data = Vec::new();
+    ihdr_data.extend_from_slice(b"IHDR");
+    ihdr_data.extend_from_slice(&15000u32.to_be_bytes()); // width 15000
+    ihdr_data.extend_from_slice(&10000u32.to_be_bytes()); // height 10000 (total = 150 MP > 100 MP limit)
+    ihdr_data.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit RGB, deflate, no filter, no interlace
+    let mut crc = 0xFFFFFFFFu32;
+    for &b in &ihdr_data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xEDB88320;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    oversized_data.extend_from_slice(&ihdr_data); // Chunk type + IHDR payload
+    oversized_data.extend_from_slice(&(!crc).to_be_bytes()); // CRC
+                                                             // Minimal empty IDAT chunk
+    let mut idat_crc = 0xFFFFFFFFu32;
+    for &b in b"IDAT" {
+        idat_crc ^= b as u32;
+        for _ in 0..8 {
+            if idat_crc & 1 != 0 {
+                idat_crc = (idat_crc >> 1) ^ 0xEDB88320;
+            } else {
+                idat_crc >>= 1;
+            }
+        }
+    }
+    oversized_data.extend_from_slice(&0u32.to_be_bytes());
+    oversized_data.extend_from_slice(b"IDAT");
+    oversized_data.extend_from_slice(&(!idat_crc).to_be_bytes());
+    // Minimal empty IEND chunk
+    let mut iend_crc = 0xFFFFFFFFu32;
+    for &b in b"IEND" {
+        iend_crc ^= b as u32;
+        for _ in 0..8 {
+            if iend_crc & 1 != 0 {
+                iend_crc = (iend_crc >> 1) ^ 0xEDB88320;
+            } else {
+                iend_crc >>= 1;
+            }
+        }
+    }
+    oversized_data.extend_from_slice(&0u32.to_be_bytes());
+    oversized_data.extend_from_slice(b"IEND");
+    oversized_data.extend_from_slice(&(!iend_crc).to_be_bytes());
+    std::fs::write(&oversized_path, &oversized_data).unwrap();
+
     let app = app();
     let w = window(&app, "main");
 
@@ -612,6 +667,145 @@ fn rejects_animated_and_oversized_images() {
         ),
         "unsupported_input",
     );
+
+    code(
+        invoke(
+            &w,
+            "import_dropped_inputs",
+            json!({"paths": [oversized_path.to_str().unwrap()]}),
+        ),
+        "resource_limit",
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn real_synthetic_image_conversion_all_combinations_e2e() {
+    let temp_dir = std::env::temp_dir().join(format!("loconv-allcomb-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+
+    let dest_dir = temp_dir.join("dest");
+    std::fs::create_dir_all(&dest_dir).unwrap();
+
+    // Create synthetic input images: PNG, JPEG, WebP
+    let png_path = temp_dir.join("test.png");
+    let jpeg_path = temp_dir.join("test.jpg");
+    let webp_path = temp_dir.join("test.webp");
+
+    let img = image::RgbImage::from_fn(20, 15, |x, y| {
+        image::Rgb([(x * 10) as u8, (y * 12) as u8, 180])
+    });
+    img.save_with_format(&png_path, image::ImageFormat::Png)
+        .unwrap();
+    img.save_with_format(&jpeg_path, image::ImageFormat::Jpeg)
+        .unwrap();
+    img.save_with_format(&webp_path, image::ImageFormat::WebP)
+        .unwrap();
+
+    let png_bytes = std::fs::read(&png_path).unwrap();
+    let jpeg_bytes = std::fs::read(&jpeg_path).unwrap();
+    let webp_bytes = std::fs::read(&webp_path).unwrap();
+
+    struct AllCombDialogs {
+        inputs: Vec<std::path::PathBuf>,
+        dest: std::path::PathBuf,
+    }
+    impl dialogs::Dialogs for AllCombDialogs {
+        fn choose(&self, directory: bool) -> EngineResult<Vec<std::path::PathBuf>> {
+            if directory {
+                Ok(vec![self.dest.clone()])
+            } else {
+                Ok(self.inputs.clone())
+            }
+        }
+    }
+
+    let app = configure(
+        mock_builder(),
+        NativeState {
+            dialogs: Arc::new(AllCombDialogs {
+                inputs: vec![png_path.clone(), jpeg_path.clone(), webp_path.clone()],
+                dest: dest_dir.clone(),
+            }),
+            ..Default::default()
+        },
+    )
+    .build(context())
+    .unwrap();
+    let w = window(&app, "main");
+
+    let imported = invoke(&w, "select_inputs", json!({})).unwrap();
+    let imported_arr = imported.as_array().unwrap();
+    assert_eq!(imported_arr.len(), 3);
+
+    let png_media_id = imported_arr
+        .iter()
+        .find(|m| m["container"] == "png")
+        .unwrap()["mediaId"]
+        .as_str()
+        .unwrap();
+    let jpeg_media_id = imported_arr
+        .iter()
+        .find(|m| m["container"] == "jpeg")
+        .unwrap()["mediaId"]
+        .as_str()
+        .unwrap();
+    let webp_media_id = imported_arr
+        .iter()
+        .find(|m| m["container"] == "webp")
+        .unwrap()["mediaId"]
+        .as_str()
+        .unwrap();
+
+    let dest_sel = invoke(&w, "select_destination", json!({})).unwrap();
+    let dest_id = dest_sel["destinationId"].as_str().unwrap();
+
+    // Test combinations:
+    // 1. PNG -> WebP
+    // 2. JPEG -> PNG
+    // 3. WebP -> JPEG
+    let test_cases = [
+        (png_media_id, "webp", "out_from_png.webp"),
+        (jpeg_media_id, "png", "out_from_jpeg.png"),
+        (webp_media_id, "jpeg", "out_from_webp.jpg"),
+    ];
+
+    for (media_id, format_id, out_name) in test_cases {
+        let enqueue_res = invoke(
+            &w,
+            "enqueue_job",
+            json!({
+                "request": {
+                    "mediaId": media_id,
+                    "destinationId": dest_id,
+                    "formatId": format_id,
+                    "outputName": out_name
+                }
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(enqueue_res["state"], "queued");
+
+        let out_file = dest_dir.join(out_name);
+        let start = std::time::Instant::now();
+        while !out_file.exists() && start.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        assert!(out_file.exists(), "Output {out_name} must be published");
+
+        // Verify readable with correct dimensions
+        let decoded = image::open(&out_file).expect("Output must be readable image");
+        assert_eq!(decoded.width(), 20);
+        assert_eq!(decoded.height(), 15);
+    }
+
+    // Verify source files are untouched
+    assert_eq!(std::fs::read(&png_path).unwrap(), png_bytes);
+    assert_eq!(std::fs::read(&jpeg_path).unwrap(), jpeg_bytes);
+    assert_eq!(std::fs::read(&webp_path).unwrap(), webp_bytes);
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }

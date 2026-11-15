@@ -112,6 +112,7 @@ fn trigger_queue_worker<R: tauri::Runtime>(state: &NativeState, app: tauri::AppH
     tauri::async_runtime::spawn(async move {
         loop {
             // Find next queued job in session
+            let cancel_token = Arc::new(AtomicBool::new(false));
             let next_work = {
                 let mut session = match session_arc.lock() {
                     Ok(s) => s,
@@ -132,6 +133,10 @@ fn trigger_queue_worker<R: tauri::Runtime>(state: &NativeState, app: tauri::AppH
                     };
                     job.progress = Some(0.0);
                     session.jobs.update(job.clone());
+
+                    if let Ok(mut tokens) = active_tokens.lock() {
+                        tokens.insert(job.job_id.clone(), cancel_token.clone());
+                    }
 
                     let input = session.inputs.get(&job.media_id).cloned();
                     let dest = session.job_destinations.get(&job.job_id).cloned();
@@ -156,37 +161,21 @@ fn trigger_queue_worker<R: tauri::Runtime>(state: &NativeState, app: tauri::AppH
                 },
             );
 
-            // Register cancellation token
-            let cancel_token = Arc::new(AtomicBool::new(false));
-            {
-                if let Ok(mut tokens) = active_tokens.lock() {
-                    tokens.insert(job.job_id.clone(), cancel_token.clone());
-                }
-            }
-
             // Spawn blocking task for conversion
             let input_path = input.path.clone();
             let final_target_path = dest.join(&job.output_name);
             let temp_target_path = dest.join(format!(".loconv-tmp-{}.tmp", uuid::Uuid::new_v4()));
             let cancel_flag = cancel_token.clone();
+            let format_id = job.format_id.clone();
+            let temp_path_for_worker = temp_target_path.clone();
 
             let run_res = tauri::async_runtime::spawn_blocking(move || {
-                let res = loconv_engine::backends::image::convert_image_to_jpeg(
+                loconv_engine::backends::image::convert_image_by_format_id(
                     &input_path,
-                    &temp_target_path,
+                    &temp_path_for_worker,
+                    &format_id,
                     &cancel_flag,
-                );
-
-                if res.is_err() || cancel_flag.load(Ordering::SeqCst) {
-                    let _ = std::fs::remove_file(&temp_target_path);
-                    if cancel_flag.load(Ordering::SeqCst) {
-                        return Ok(false); // Cancelled
-                    }
-                    return Err(res.unwrap_err());
-                }
-
-                paths::atomic_publish_no_overwrite(&temp_target_path, &final_target_path)?;
-                Ok(true) // Succeeded
+                )
             })
             .await;
 
@@ -197,11 +186,16 @@ fn trigger_queue_worker<R: tauri::Runtime>(state: &NativeState, app: tauri::AppH
                 }
             }
 
-            // Update final state in session and emit
+            // Update final state in session and emit.
+            // Cancellation and publication are serialized under the session lock:
+            // if cancellation is accepted first, no final output is published.
             let final_snapshot = {
                 let mut session = match session_arc.lock() {
                     Ok(s) => s,
-                    Err(_) => break,
+                    Err(_) => {
+                        let _ = std::fs::remove_file(&temp_target_path);
+                        break;
+                    }
                 };
 
                 // Free reservation
@@ -213,27 +207,36 @@ fn trigger_queue_worker<R: tauri::Runtime>(state: &NativeState, app: tauri::AppH
                 let mut current = session.jobs.get(&job.job_id).cloned().unwrap_or(job);
 
                 if current.state == JobState::Cancelling || cancel_token.load(Ordering::SeqCst) {
+                    let _ = std::fs::remove_file(&temp_target_path);
                     current.state = JobState::Cancelled;
                     current.revision = current.revision.checked_add(1).unwrap_or(current.revision);
                     current.progress = None;
                     current.error = None;
                 } else if !loconv_engine::jobs::is_terminal(&current.state) {
                     match run_res {
-                        Ok(Ok(true)) => {
-                            current.state = JobState::Succeeded;
-                            current.revision =
-                                current.revision.checked_add(1).unwrap_or(current.revision);
-                            current.progress = Some(1.0);
-                            current.error = None;
-                        }
-                        Ok(Ok(false)) => {
-                            current.state = JobState::Cancelled;
-                            current.revision =
-                                current.revision.checked_add(1).unwrap_or(current.revision);
-                            current.progress = None;
-                            current.error = None;
+                        Ok(Ok(())) => {
+                            match paths::atomic_publish_no_overwrite(
+                                &temp_target_path,
+                                &final_target_path,
+                            ) {
+                                Ok(()) => {
+                                    current.state = JobState::Succeeded;
+                                    current.revision =
+                                        current.revision.checked_add(1).unwrap_or(current.revision);
+                                    current.progress = Some(1.0);
+                                    current.error = None;
+                                }
+                                Err(err) => {
+                                    current.state = JobState::Failed;
+                                    current.revision =
+                                        current.revision.checked_add(1).unwrap_or(current.revision);
+                                    current.progress = None;
+                                    current.error = Some(err);
+                                }
+                            }
                         }
                         Ok(Err(err)) => {
+                            let _ = std::fs::remove_file(&temp_target_path);
                             current.state = JobState::Failed;
                             current.revision =
                                 current.revision.checked_add(1).unwrap_or(current.revision);
@@ -241,6 +244,7 @@ fn trigger_queue_worker<R: tauri::Runtime>(state: &NativeState, app: tauri::AppH
                             current.error = Some(err);
                         }
                         Err(_) => {
+                            let _ = std::fs::remove_file(&temp_target_path);
                             current.state = JobState::Failed;
                             current.revision =
                                 current.revision.checked_add(1).unwrap_or(current.revision);
@@ -248,6 +252,8 @@ fn trigger_queue_worker<R: tauri::Runtime>(state: &NativeState, app: tauri::AppH
                             current.error = Some(errors::internal());
                         }
                     }
+                } else {
+                    let _ = std::fs::remove_file(&temp_target_path);
                 }
 
                 session.jobs.update(current.clone());
