@@ -1731,10 +1731,17 @@ dependencies = [
 name = "loconv-desktop"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "loconv-contracts",
  "loconv-engine",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "serde",
+ "serde_json",
  "tauri",
  "tauri-build",
+ "uuid",
 ]
 
 [[package]]
@@ -1742,6 +1749,7 @@ name = "loconv-engine"
 version = "0.1.0"
 dependencies = [
  "loconv-contracts",
+ "uuid",
 ]
 
 [[package]]
