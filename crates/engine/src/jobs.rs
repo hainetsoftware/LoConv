@@ -73,6 +73,16 @@ impl JobRegistry {
         Ok(job)
     }
 
+    pub fn update(&mut self, snapshot: loconv_contracts::JobSnapshot) {
+        if let Some(existing) = self.jobs.iter_mut().find(|j| j.job_id == snapshot.job_id) {
+            *existing = snapshot;
+        }
+    }
+
+    pub fn get(&self, id: &str) -> Option<&loconv_contracts::JobSnapshot> {
+        self.jobs.iter().find(|j| j.job_id == id)
+    }
+
     pub fn cancel(
         &mut self,
         id: &str,
@@ -88,18 +98,17 @@ impl JobRegistry {
                 retryable: false,
             })?;
         if !is_terminal(&job.state) {
-            // This registry only creates queued jobs. Active worker cancellation
-            // must be implemented with a supervisor before workers are enabled.
-            if job.state != JobState::Queued {
-                return Err(crate::errors::internal());
-            }
             job.revision = job
                 .revision
                 .checked_add(1)
                 .ok_or_else(crate::errors::internal)?;
-            job.state = JobState::Cancelled;
-            job.progress = None;
-            job.error = None;
+            if job.state == JobState::Queued {
+                job.state = JobState::Cancelled;
+                job.progress = None;
+                job.error = None;
+            } else if job.state == JobState::Running {
+                job.state = JobState::Cancelling;
+            }
         }
         Ok(job.clone())
     }

@@ -125,29 +125,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_is_complete_and_disabled_without_backends() {
+    fn registry_is_complete_and_derives_availability_from_backends() {
         let descriptors = descriptors();
         assert_eq!(descriptors.len(), REGISTRY.len());
         assert_eq!(descriptors.len(), 7);
 
         for descriptor in &descriptors {
-            assert!(!descriptor.available);
-            assert!(descriptor.unavailable_reason.is_some());
             assert!(!descriptor.label.is_empty());
             assert!(!descriptor.input_kinds.is_empty());
             assert!(!descriptor.extension.is_empty());
-        }
-    }
-
-    #[test]
-    fn unavailable_reason_matches_backend() {
-        let descriptors = descriptors();
-        for descriptor in descriptors {
-            let expected = match descriptor.backend {
-                Backend::Ffmpeg => ErrorCode::ToolUnavailable,
-                Backend::Image => ErrorCode::UnsupportedFormat,
-            };
-            assert_eq!(descriptor.unavailable_reason, Some(expected));
+            match descriptor.backend {
+                Backend::Ffmpeg => {
+                    assert!(!descriptor.available);
+                    assert_eq!(
+                        descriptor.unavailable_reason,
+                        Some(ErrorCode::ToolUnavailable)
+                    );
+                }
+                Backend::Image => {
+                    assert!(descriptor.available);
+                    assert_eq!(descriptor.unavailable_reason, None);
+                }
+            }
         }
     }
 

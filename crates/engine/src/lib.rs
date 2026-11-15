@@ -12,6 +12,7 @@ pub mod inspection;
 pub mod jobs;
 pub mod paths;
 
+pub use image;
 pub use loconv_contracts as contracts;
 
 /// IPC version implemented by this engine.

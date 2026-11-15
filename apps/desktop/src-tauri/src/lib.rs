@@ -2,23 +2,37 @@
 mod dialogs;
 mod session;
 use loconv_contracts::*;
-use loconv_engine::errors::{self, EngineResult};
+use loconv_engine::{
+    errors::{self, EngineResult},
+    paths,
+};
 use serde::{de::DeserializeOwned, Deserialize};
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+};
 use tauri::{
     ipc::{InvokeBody, Request},
     Emitter, State,
 };
 
 struct NativeState {
-    session: Mutex<session::Session>,
+    session: Arc<Mutex<session::Session>>,
     dialogs: Arc<dyn dialogs::Dialogs>,
+    active_tokens: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    is_processing: Arc<AtomicBool>,
 }
+
 impl Default for NativeState {
     fn default() -> Self {
         Self {
-            session: Mutex::default(),
+            session: Arc::new(Mutex::default()),
             dialogs: Arc::new(dialogs::NativeDialogs),
+            active_tokens: Arc::new(Mutex::default()),
+            is_processing: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -33,19 +47,23 @@ fn args<T: DeserializeOwned>(request: &Request<'_>) -> EngineResult<T> {
         _ => Err(errors::invalid_request()),
     }
 }
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Empty {}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Dropped {
     paths: Vec<String>,
 }
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Enqueue {
     request: ConversionRequest,
 }
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Cancel {
@@ -57,11 +75,13 @@ fn get_api_version(request: Request<'_>) -> EngineResult<u32> {
     args::<Empty>(&request)?;
     Ok(loconv_engine::api_version())
 }
+
 #[tauri::command]
 fn list_formats(request: Request<'_>) -> EngineResult<Vec<FormatDescriptor>> {
     args::<Empty>(&request)?;
     Ok(loconv_engine::formats::descriptors())
 }
+
 #[tauri::command]
 fn list_jobs(
     request: Request<'_>,
@@ -75,15 +95,197 @@ fn list_jobs(
         .jobs
         .list())
 }
+
+fn trigger_queue_worker<R: tauri::Runtime>(state: &NativeState, app: tauri::AppHandle<R>) {
+    if state
+        .is_processing
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+
+    let session_arc = state.session.clone();
+    let is_processing = state.is_processing.clone();
+    let active_tokens = state.active_tokens.clone();
+
+    tauri::async_runtime::spawn(async move {
+        loop {
+            // Find next queued job in session
+            let next_work = {
+                let mut session = match session_arc.lock() {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+
+                let queued = session
+                    .jobs
+                    .list()
+                    .into_iter()
+                    .find(|j| j.state == JobState::Queued);
+
+                if let Some(mut job) = queued {
+                    job.state = JobState::Running;
+                    job.revision = match job.revision.checked_add(1) {
+                        Some(r) => r,
+                        None => break,
+                    };
+                    job.progress = Some(0.0);
+                    session.jobs.update(job.clone());
+
+                    let input = session.inputs.get(&job.media_id).cloned();
+                    let dest = session.job_destinations.get(&job.job_id).cloned();
+
+                    (Some(job), input, dest)
+                } else {
+                    (None, None, None)
+                }
+            };
+
+            let (Some(job), Some(input), Some(dest)) = next_work else {
+                break;
+            };
+
+            // Emit Running state event
+            let _ = app.emit_to(
+                "main",
+                "loconv://job-changed",
+                JobEvent {
+                    api_version: API_VERSION,
+                    job: job.clone(),
+                },
+            );
+
+            // Register cancellation token
+            let cancel_token = Arc::new(AtomicBool::new(false));
+            {
+                if let Ok(mut tokens) = active_tokens.lock() {
+                    tokens.insert(job.job_id.clone(), cancel_token.clone());
+                }
+            }
+
+            // Spawn blocking task for conversion
+            let input_path = input.path.clone();
+            let final_target_path = dest.join(&job.output_name);
+            let temp_target_path = dest.join(format!(".loconv-tmp-{}.tmp", uuid::Uuid::new_v4()));
+            let cancel_flag = cancel_token.clone();
+
+            let run_res = tauri::async_runtime::spawn_blocking(move || {
+                let res = loconv_engine::backends::image::convert_image_to_jpeg(
+                    &input_path,
+                    &temp_target_path,
+                    &cancel_flag,
+                );
+
+                if res.is_err() || cancel_flag.load(Ordering::SeqCst) {
+                    let _ = std::fs::remove_file(&temp_target_path);
+                    if cancel_flag.load(Ordering::SeqCst) {
+                        return Ok(false); // Cancelled
+                    }
+                    return Err(res.unwrap_err());
+                }
+
+                paths::atomic_publish_no_overwrite(&temp_target_path, &final_target_path)?;
+                Ok(true) // Succeeded
+            })
+            .await;
+
+            // Clean up token
+            {
+                if let Ok(mut tokens) = active_tokens.lock() {
+                    tokens.remove(&job.job_id);
+                }
+            }
+
+            // Update final state in session and emit
+            let final_snapshot = {
+                let mut session = match session_arc.lock() {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+
+                // Free reservation
+                session
+                    .reserved_targets
+                    .remove(&dest.join(&job.output_name));
+                session.job_destinations.remove(&job.job_id);
+
+                let mut current = session.jobs.get(&job.job_id).cloned().unwrap_or(job);
+
+                if current.state == JobState::Cancelling || cancel_token.load(Ordering::SeqCst) {
+                    current.state = JobState::Cancelled;
+                    current.revision = current.revision.checked_add(1).unwrap_or(current.revision);
+                    current.progress = None;
+                    current.error = None;
+                } else if !loconv_engine::jobs::is_terminal(&current.state) {
+                    match run_res {
+                        Ok(Ok(true)) => {
+                            current.state = JobState::Succeeded;
+                            current.revision =
+                                current.revision.checked_add(1).unwrap_or(current.revision);
+                            current.progress = Some(1.0);
+                            current.error = None;
+                        }
+                        Ok(Ok(false)) => {
+                            current.state = JobState::Cancelled;
+                            current.revision =
+                                current.revision.checked_add(1).unwrap_or(current.revision);
+                            current.progress = None;
+                            current.error = None;
+                        }
+                        Ok(Err(err)) => {
+                            current.state = JobState::Failed;
+                            current.revision =
+                                current.revision.checked_add(1).unwrap_or(current.revision);
+                            current.progress = None;
+                            current.error = Some(err);
+                        }
+                        Err(_) => {
+                            current.state = JobState::Failed;
+                            current.revision =
+                                current.revision.checked_add(1).unwrap_or(current.revision);
+                            current.progress = None;
+                            current.error = Some(errors::internal());
+                        }
+                    }
+                }
+
+                session.jobs.update(current.clone());
+                current
+            };
+
+            let _ = app.emit_to(
+                "main",
+                "loconv://job-changed",
+                JobEvent {
+                    api_version: API_VERSION,
+                    job: final_snapshot,
+                },
+            );
+        }
+
+        is_processing.store(false, Ordering::SeqCst);
+    });
+}
+
 #[tauri::command]
-fn enqueue_job(request: Request<'_>, state: State<'_, NativeState>) -> EngineResult<JobSnapshot> {
+fn enqueue_job<R: tauri::Runtime>(
+    request: Request<'_>,
+    state: State<'_, NativeState>,
+    app: tauri::AppHandle<R>,
+) -> EngineResult<JobSnapshot> {
     let payload: Enqueue = args(&request)?;
-    state
+    let snapshot = state
         .session
         .lock()
         .map_err(|_| errors::internal())?
-        .enqueue(payload.request)
+        .enqueue(payload.request)?;
+
+    trigger_queue_worker(&state, app);
+
+    Ok(snapshot)
 }
+
 #[tauri::command]
 fn cancel_job<R: tauri::Runtime>(
     request: Request<'_>,
@@ -94,34 +296,77 @@ fn cancel_job<R: tauri::Runtime>(
     if payload.job_id.is_empty() {
         return Err(errors::invalid_request());
     }
-    // Serialize mutation and publication together; do not hold a lock across I/O.
+
     let mut session = state.session.lock().map_err(|_| errors::internal())?;
-    let before = session
+    let job = session
         .jobs
         .list()
         .into_iter()
-        .find(|j| j.job_id == payload.job_id);
-    let job = session.jobs.cancel(&payload.job_id)?;
-    if before
-        .as_ref()
-        .is_some_and(|old| old.revision < job.revision)
-    {
+        .find(|j| j.job_id == payload.job_id)
+        .ok_or_else(|| AppError {
+            code: ErrorCode::JobNotFound,
+            message: "The job was not found in this session.".into(),
+            retryable: false,
+        })?;
+
+    if loconv_engine::jobs::is_terminal(&job.state) {
+        return Ok(job);
+    }
+
+    if job.state == JobState::Queued {
+        let updated = session.jobs.cancel(&payload.job_id)?;
+        if let Some(dest) = session.job_destinations.remove(&payload.job_id) {
+            session
+                .reserved_targets
+                .remove(&dest.join(&updated.output_name));
+        }
         app.emit_to(
             "main",
             "loconv://job-changed",
             JobEvent {
                 api_version: API_VERSION,
-                job: job.clone(),
+                job: updated.clone(),
             },
         )
         .map_err(|_| errors::internal())?;
+        return Ok(updated);
     }
+
+    if job.state == JobState::Running {
+        if let Some(token) = state.active_tokens.lock().unwrap().get(&payload.job_id) {
+            token.store(true, Ordering::SeqCst);
+        }
+        let updated = session.jobs.cancel(&payload.job_id)?;
+        app.emit_to(
+            "main",
+            "loconv://job-changed",
+            JobEvent {
+                api_version: API_VERSION,
+                job: updated.clone(),
+            },
+        )
+        .map_err(|_| errors::internal())?;
+        return Ok(updated);
+    }
+
+    if job.state == JobState::Cancelling {
+        return Ok(job);
+    }
+
     Ok(job)
 }
+
 #[tauri::command]
-fn import_dropped_inputs(request: Request<'_>) -> EngineResult<Vec<InputInspection>> {
+fn import_dropped_inputs(
+    request: Request<'_>,
+    state: State<'_, NativeState>,
+) -> EngineResult<Vec<InputInspection>> {
     let payload: Dropped = args(&request)?;
-    session::import(payload.paths)
+    state
+        .session
+        .lock()
+        .map_err(|_| errors::internal())?
+        .import(payload.paths)
 }
 
 async fn choose<R: tauri::Runtime>(
@@ -138,6 +383,7 @@ async fn choose<R: tauri::Runtime>(
         .await
         .map_err(|_| errors::internal())??
 }
+
 #[tauri::command]
 async fn select_inputs<R: tauri::Runtime>(
     request: Request<'_>,
@@ -154,8 +400,13 @@ async fn select_inputs<R: tauri::Runtime>(
                 .map_err(|_| errors::invalid_request())
         })
         .collect::<EngineResult<Vec<_>>>()?;
-    session::import(paths)
+    state
+        .session
+        .lock()
+        .map_err(|_| errors::internal())?
+        .import(paths)
 }
+
 #[tauri::command]
 async fn select_destination<R: tauri::Runtime>(
     request: Request<'_>,
