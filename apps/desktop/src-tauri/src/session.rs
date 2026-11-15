@@ -14,6 +14,7 @@ use uuid::Uuid;
 #[derive(Debug, Clone)]
 pub struct InputRecord {
     pub path: PathBuf,
+    pub identity: paths::SourceIdentity,
     pub size_bytes: u64,
     pub mtime: std::time::SystemTime,
     pub inspection: InputInspection,
@@ -21,6 +22,7 @@ pub struct InputRecord {
 
 #[derive(Default)]
 pub struct Session {
+    pub encoder: Option<loconv_engine::backends::ffmpeg::TrustedFfmpeg>,
     pub probe: Option<loconv_engine::backends::ffmpeg::TrustedProbe>,
     pub inputs: HashMap<String, InputRecord>,
     pub destinations: HashMap<String, PathBuf>,
@@ -76,11 +78,20 @@ impl Session {
         let mut staged: Vec<InputRecord> = Vec::with_capacity(paths.len());
         for path_str in &paths {
             let path = Path::new(path_str);
+            inspection::validate_selection_path_syntax(path)?;
+            let before =
+                std::fs::symlink_metadata(path).map_err(|_| errors::inspection_failed())?;
+            let identity =
+                paths::SourceIdentity::capture(&before).map_err(|_| errors::invalid_request())?;
             let inspection = inspection::inspect_local_file_with_probe(path, self.probe.as_ref())?;
+            identity.open(path)?;
             let meta = std::fs::symlink_metadata(path).map_err(|_| errors::inspection_failed())?;
             let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
             staged.push(InputRecord {
-                path: path.to_path_buf(),
+                identity,
+                path: path
+                    .canonicalize()
+                    .map_err(|_| errors::input_unavailable())?,
                 size_bytes: meta.len(),
                 mtime,
                 inspection,
@@ -106,7 +117,11 @@ impl Session {
         }
 
         // Never create a queued/successful job without a real runnable backend.
-        match spec.descriptor().unavailable_reason {
+        let descriptor = formats::descriptors_with_audio(self.encoder.as_ref())
+            .into_iter()
+            .find(|d| d.id == request.format_id)
+            .ok_or_else(errors::unsupported_format)?;
+        match descriptor.unavailable_reason {
             Some(ErrorCode::ToolUnavailable) => return Err(errors::tool_unavailable()),
             Some(_) => return Err(errors::unsupported_format()),
             None => (),
@@ -128,6 +143,17 @@ impl Session {
             return Err(errors::unsupported_format());
         }
 
+        if spec.backend == Backend::Ffmpeg && self.probe.is_none() {
+            return Err(errors::tool_unavailable());
+        }
+        input_entry.identity.open(&input_entry.path)?;
+        if spec.backend == Backend::Ffmpeg
+            && !self.encoder.as_ref().is_some_and(|encoder| {
+                encoder.supports_input(&request.format_id, &input_entry.inspection)
+            })
+        {
+            return Err(errors::unsupported_format());
+        }
         // 3. Revalidate input file identity/size/mtime
         let meta = std::fs::symlink_metadata(&input_entry.path)
             .map_err(|_| errors::input_unavailable())?;
@@ -157,7 +183,7 @@ impl Session {
         }
 
         // Existing destination file check (never overwrite!)
-        if final_target_path.exists() {
+        if std::fs::symlink_metadata(&final_target_path).is_ok() {
             return Err(errors::output_conflict());
         }
 

@@ -17,7 +17,7 @@ impl dialogs::Dialogs for CancelledDialogs {
 fn app() -> tauri::App<tauri::test::MockRuntime> {
     // Use production context/ACL and command registration, with OS dialogs replaced
     // so tests never open a picker or access personal media.
-    configure(
+    let app = configure(
         mock_builder(),
         NativeState {
             dialogs: Arc::new(CancelledDialogs),
@@ -25,7 +25,15 @@ fn app() -> tauri::App<tauri::test::MockRuntime> {
         },
     )
     .build(context())
-    .unwrap()
+    .unwrap();
+    // General IPC tests have deterministic unavailable tools even in opt-in runs.
+    {
+        let state = app.state::<NativeState>();
+        let mut session = state.session.lock().unwrap();
+        session.encoder = None;
+        session.probe = None;
+    }
+    app
 }
 fn window(
     app: &tauri::App<tauri::test::MockRuntime>,
@@ -853,6 +861,7 @@ fn real_audio_picker_and_drop_inspection() {
     .build(context())
     .unwrap();
     app.state::<NativeState>().session.lock().unwrap().probe = Some(probe);
+    app.state::<NativeState>().session.lock().unwrap().encoder = None;
     let w = window(&app, "main");
     for (command, body) in [
         ("select_inputs", json!({})),
@@ -894,5 +903,248 @@ fn real_audio_picker_and_drop_inspection() {
         2
     );
     assert_eq!(std::fs::read(&path).unwrap(), wav);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(all(debug_assertions, feature = "dev-tools", target_os = "macos"))]
+#[test]
+#[ignore = "requires explicitly pinned development tools; synthetic native audio queue"]
+fn real_audio_native_queue() {
+    use std::time::{Duration, Instant};
+    let root = std::path::Path::new("/unused-resource-root");
+    let probe = loconv_engine::backends::ffmpeg::TrustedProbe::resolve(root).unwrap();
+    let encoder = loconv_engine::backends::ffmpeg::TrustedFfmpeg::resolve(root).unwrap();
+    let dir = std::env::temp_dir().join(format!("loconv-native-encode-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let input = dir.join("generated.wav");
+    let mut wav = Vec::new();
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&96036u32.to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&48000u32.to_le_bytes());
+    wav.extend_from_slice(&96000u32.to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&96000u32.to_le_bytes());
+    wav.resize(96044, 0);
+    std::fs::write(&input, &wav).unwrap();
+    let image_input = dir.join("generated.png");
+    image::RgbImage::new(8, 8).save(&image_input).unwrap();
+    let app = app();
+    {
+        let state = app.state::<NativeState>();
+        let mut session = state.session.lock().unwrap();
+        session.probe = Some(probe);
+        session.encoder = Some(encoder);
+    }
+    let w = window(&app, "main");
+    let selection = session::prepare_destination(dir.clone()).unwrap();
+    let destination = app
+        .state::<NativeState>()
+        .session
+        .lock()
+        .unwrap()
+        .destination(Some(selection))
+        .unwrap()
+        .unwrap();
+    let formats = invoke(&w, "list_formats", json!({})).unwrap();
+    for format in ["mp3", "wav_pcm16"] {
+        assert_eq!(
+            formats
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|d| d["id"] == format)
+                .unwrap()["available"],
+            true
+        );
+    }
+    let mut jobs = Vec::new();
+    for (path, format, name) in [
+        (&input, "mp3", "converted.mp3"),
+        (&image_input, "webp", "converted.webp"),
+        (&input, "wav_pcm16", "converted.wav"),
+    ] {
+        let imported = invoke(&w, "import_dropped_inputs", json!({"paths":[path]})).unwrap();
+        let queued = invoke(&w, "enqueue_job", json!({"request":{"mediaId":imported[0]["mediaId"],"destinationId":destination.destination_id,"formatId":format,"outputName":name}})).unwrap();
+        jobs.push(queued["jobId"].as_str().unwrap().to_owned());
+    }
+    let start = Instant::now();
+    loop {
+        let list = invoke(&w, "list_jobs", json!({})).unwrap();
+        let states = list.as_array().unwrap();
+        assert!(states.iter().filter(|j| j["state"] == "running").count() <= 1);
+        if states.iter().all(|j| j["state"] == "succeeded") {
+            break;
+        }
+        assert!(!states.iter().any(|j| j["state"] == "failed"));
+        assert!(start.elapsed() < Duration::from_secs(15));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    for id in jobs {
+        let completed = invoke(&w, "cancel_job", json!({"jobId":id})).unwrap();
+        assert_eq!(completed["state"], "succeeded");
+        assert_eq!(completed["progress"], 1.0);
+    }
+    assert_eq!(std::fs::read(&input).unwrap(), wav);
+    assert!(app
+        .state::<NativeState>()
+        .session
+        .lock()
+        .unwrap()
+        .reserved_targets
+        .is_empty());
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 5);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn concurrent_enqueue_cancel_and_worker_restart() {
+    use std::time::{Duration, Instant};
+    let dir = std::env::temp_dir().join(format!("loconv-queue-race-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let input = dir.join("synthetic.png");
+    image::RgbImage::new(32, 32).save(&input).unwrap();
+    let app = app();
+    let w = window(&app, "main");
+    let imported = invoke(&w, "import_dropped_inputs", json!({"paths":[input]})).unwrap();
+    let media = imported[0]["mediaId"].as_str().unwrap().to_owned();
+    let destination = app
+        .state::<NativeState>()
+        .session
+        .lock()
+        .unwrap()
+        .destination(Some(session::prepare_destination(dir.clone()).unwrap()))
+        .unwrap()
+        .unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    let handles: Vec<_> = (0..8).map(|index| {
+        let w = w.clone(); let media = media.clone(); let destination = destination.destination_id.clone(); let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            let job = invoke(&w, "enqueue_job", json!({"request":{"mediaId":media,"destinationId":destination,"formatId":"webp","outputName":format!("synthetic-{index}.webp")}})).unwrap();
+            let cancelled = invoke(&w, "cancel_job", json!({"jobId":job["jobId"]})).unwrap();
+            let again = invoke(&w, "cancel_job", json!({"jobId":job["jobId"]})).unwrap();
+            assert!(again["revision"].as_u64().unwrap() >= cancelled["revision"].as_u64().unwrap());
+            job["jobId"].as_str().unwrap().to_owned()
+        })
+    }).collect();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    let start = Instant::now();
+    loop {
+        let list = invoke(&w, "list_jobs", json!({})).unwrap();
+        let jobs = list.as_array().unwrap();
+        assert!(jobs.iter().filter(|j| j["state"] == "running").count() <= 1);
+        if jobs
+            .iter()
+            .all(|j| j["state"] == "succeeded" || j["state"] == "cancelled")
+        {
+            for job in jobs {
+                assert_eq!(
+                    dir.join(job["outputName"].as_str().unwrap()).exists(),
+                    job["state"] == "succeeded"
+                );
+            }
+            break;
+        }
+        assert!(start.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // Repeatedly enqueue after an idle worker exits, exercising the worker gate.
+    for index in 0..8 {
+        let job = invoke(&w, "enqueue_job", json!({"request":{"mediaId":media,"destinationId":destination.destination_id,"formatId":"png","outputName":format!("restart-{index}.png")}})).unwrap();
+        let start = Instant::now();
+        while app
+            .state::<NativeState>()
+            .session
+            .lock()
+            .unwrap()
+            .jobs
+            .get(job["jobId"].as_str().unwrap())
+            .unwrap()
+            .state
+            != JobState::Succeeded
+        {
+            assert!(start.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    // Hold only the worker gate to stage deterministic failed/queued-cancelled work.
+    let start = Instant::now();
+    while app
+        .state::<NativeState>()
+        .is_processing
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        assert!(start.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let request = |name: &str, media: &str| json!({"request":{"mediaId":media,"destinationId":destination.destination_id,"formatId":"png","outputName":name}});
+    let failed = invoke(&w, "enqueue_job", request("failed.png", &media)).unwrap();
+    let cancelled_request = request("cancelled.png", &media);
+    let cancelled = invoke(&w, "enqueue_job", cancelled_request.clone()).unwrap();
+    code(
+        invoke(&w, "enqueue_job", cancelled_request),
+        "output_conflict",
+    );
+    let once = invoke(&w, "cancel_job", json!({"jobId":cancelled["jobId"]})).unwrap();
+    assert_eq!(once["state"], "cancelled");
+    assert_eq!(
+        invoke(&w, "cancel_job", json!({"jobId":cancelled["jobId"]})).unwrap(),
+        once
+    );
+    let healthy = dir.join("healthy.png");
+    image::RgbImage::new(8, 8).save(&healthy).unwrap();
+    let imported = invoke(&w, "import_dropped_inputs", json!({"paths":[healthy]})).unwrap();
+    let continuation = invoke(
+        &w,
+        "enqueue_job",
+        request("continued.png", imported[0]["mediaId"].as_str().unwrap()),
+    )
+    .unwrap();
+    std::fs::write(&input, b"changed synthetic source").unwrap();
+    let state = app.state::<NativeState>();
+    state.is_processing.store(false, Ordering::SeqCst);
+    trigger_queue_worker(&state, app.handle().clone());
+    let start = Instant::now();
+    while state
+        .session
+        .lock()
+        .unwrap()
+        .jobs
+        .get(continuation["jobId"].as_str().unwrap())
+        .unwrap()
+        .state
+        != JobState::Succeeded
+    {
+        assert!(start.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let failed = state
+        .session
+        .lock()
+        .unwrap()
+        .jobs
+        .get(failed["jobId"].as_str().unwrap())
+        .unwrap()
+        .clone();
+    assert_eq!(failed.state, JobState::Failed);
+    assert_eq!(failed.error.unwrap().code, ErrorCode::InputUnavailable);
+    assert!(!dir.join("failed.png").exists());
+    assert!(!dir.join("cancelled.png").exists());
+    assert!(app
+        .state::<NativeState>()
+        .session
+        .lock()
+        .unwrap()
+        .reserved_targets
+        .is_empty());
     std::fs::remove_dir_all(dir).unwrap();
 }

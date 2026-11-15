@@ -2,7 +2,7 @@
 //!
 //! Descriptors describe real input/output combinations. Availability is derived
 //! from backend capability, never from file extensions or optimistic defaults.
-//! Images are available; FFmpeg encoding remains unavailable until Sprint 05B.
+//! Images are available; audio needs an explicitly configured trusted encoder.
 
 use loconv_contracts::{Backend, ErrorCode, FormatDescriptor, FormatId, MediaKind};
 
@@ -20,7 +20,7 @@ pub struct FormatSpec {
 }
 
 const VIDEO_ONLY: &[MediaKind] = &[MediaKind::Video];
-const AUDIO_OR_VIDEO: &[MediaKind] = &[MediaKind::Audio, MediaKind::Video];
+const AUDIO_OR_VIDEO: &[MediaKind] = &[MediaKind::Audio];
 const IMAGE_ONLY: &[MediaKind] = &[MediaKind::Image];
 
 pub const REGISTRY: &[FormatSpec] = &[
@@ -118,6 +118,22 @@ pub fn descriptors() -> Vec<FormatDescriptor> {
 /// Find a registry entry without consulting the filesystem.
 pub fn find(id: &FormatId) -> Option<&'static FormatSpec> {
     REGISTRY.iter().find(|spec| &spec.id == id)
+}
+
+/// Session capabilities come exclusively from the configured trusted encoder.
+pub fn descriptors_with_audio(
+    tool: Option<&backends::ffmpeg::TrustedFfmpeg>,
+) -> Vec<FormatDescriptor> {
+    descriptors()
+        .into_iter()
+        .map(|mut d| {
+            if tool.is_some_and(|t| t.supports(&d.id)) {
+                d.available = true;
+                d.unavailable_reason = None;
+            }
+            d
+        })
+        .collect()
 }
 
 #[cfg(test)]

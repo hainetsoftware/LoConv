@@ -1,7 +1,7 @@
 //! Job lifecycle helpers.
 //!
 //! Bounded session-only snapshot storage. The host serializes access with its
-//! session mutex. No worker, file I/O, successful conversions or persistence.
+//! session mutex. The host owns the shared FIFO worker; no persistence.
 
 use loconv_contracts::JobState;
 
@@ -75,7 +75,9 @@ impl JobRegistry {
 
     pub fn update(&mut self, snapshot: loconv_contracts::JobSnapshot) {
         if let Some(existing) = self.jobs.iter_mut().find(|j| j.job_id == snapshot.job_id) {
-            *existing = snapshot;
+            if !is_terminal(&existing.state) && snapshot.revision > existing.revision {
+                *existing = snapshot;
+            }
         }
     }
 
@@ -97,7 +99,7 @@ impl JobRegistry {
                 message: "The job was not found in this session.".into(),
                 retryable: false,
             })?;
-        if !is_terminal(&job.state) {
+        if can_request_cancel(&job.state) {
             job.revision = job
                 .revision
                 .checked_add(1)

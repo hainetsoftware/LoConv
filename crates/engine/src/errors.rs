@@ -87,6 +87,14 @@ pub fn internal() -> AppError {
     app_error(ErrorCode::Internal, INTERNAL_MESSAGE, false)
 }
 
+pub fn cleanup_failed() -> AppError {
+    app_error(
+        ErrorCode::Internal,
+        "The temporary output could not be removed.",
+        false,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

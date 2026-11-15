@@ -1,8 +1,6 @@
 //! Local media backends.
 //!
-//! Backends are placeholders in this increment: neither FFmpeg execution nor
-//! image decoding/encoding is implemented. They deliberately report
-//! unavailable so no caller can advertise a missing capability.
+//! Still-image codecs and trusted, fixed FFmpeg/FFprobe audio operations.
 
 pub mod ffmpeg;
 pub mod image;

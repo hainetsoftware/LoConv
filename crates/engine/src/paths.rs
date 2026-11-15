@@ -1,8 +1,6 @@
 //! Pure output-name and path-string validation.
 //!
-//! No filesystem access occurs here. Destinations, file identity, symlinks and
-//! mount locality are validated by later host increments. These rules reject
-//! basename injection before any path is joined or opened.
+//! Validates basenames and source identity and publishes without replacing targets.
 
 use std::path::Path;
 
@@ -63,28 +61,91 @@ pub fn validate_output_name(name: &str, expected_extension: &str) -> EngineResul
 
 /// Atomically publish a temporary file to its final destination without overwriting.
 ///
-/// Ensures the target does not already exist, creates a hard link to `final_path`,
-/// and unlinks `temp_path`. If `final_path` exists, fails with `OutputConflict`
-/// and cleans up `temp_path`.
+/// macOS uses exclusive rename, atomically consuming the temporary name. The
+/// portability fallback uses a no-replace hard link. Every cleanup error is surfaced.
 pub fn atomic_publish_no_overwrite(temp_path: &Path, final_path: &Path) -> EngineResult<()> {
-    if final_path.exists() {
-        let _ = std::fs::remove_file(temp_path);
-        return Err(errors::output_conflict());
-    }
-
-    match std::fs::hard_link(temp_path, final_path) {
-        Ok(()) => {
-            let _ = std::fs::remove_file(temp_path);
-            Ok(())
+    #[cfg(target_os = "macos")]
+    {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+        let from =
+            CString::new(temp_path.as_os_str().as_bytes()).map_err(|_| errors::internal())?;
+        let to = CString::new(final_path.as_os_str().as_bytes()).map_err(|_| errors::internal())?;
+        // SAFETY: valid path strings; RENAME_EXCL atomically refuses every existing target.
+        if unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) } == 0 {
+            return Ok(());
         }
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            let _ = std::fs::remove_file(temp_path);
+        let err = std::io::Error::last_os_error();
+        cleanup_temp(temp_path)?;
+        if err.kind() == std::io::ErrorKind::AlreadyExists {
             Err(errors::output_conflict())
-        }
-        Err(_) => {
-            let _ = std::fs::remove_file(temp_path);
+        } else {
             Err(errors::internal())
         }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let result = std::fs::hard_link(temp_path, final_path);
+        cleanup_temp(temp_path)?;
+        match result {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(errors::output_conflict())
+            }
+            Err(_) => Err(errors::internal()),
+        }
+    }
+}
+
+/// Remove only the current job's engine-owned temporary output.
+pub fn cleanup_temp(path: &Path) -> EngineResult<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(errors::cleanup_failed()),
+    }
+}
+
+/// Captured at import and compared against the opened source before work starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceIdentity {
+    size: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+impl SourceIdentity {
+    pub fn capture(meta: &std::fs::Metadata) -> EngineResult<Self> {
+        if !meta.is_file() {
+            return Err(errors::input_unavailable());
+        }
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Ok(Self {
+            size: meta.len(),
+            modified: meta.modified().map_err(|_| errors::input_unavailable())?,
+            #[cfg(unix)]
+            device: meta.dev(),
+            #[cfg(unix)]
+            inode: meta.ino(),
+        })
+    }
+    pub fn open(&self, path: &Path) -> EngineResult<std::fs::File> {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = options
+            .open(path)
+            .map_err(|_| errors::input_unavailable())?;
+        if Self::capture(&file.metadata().map_err(|_| errors::input_unavailable())?)? != *self {
+            return Err(errors::input_unavailable());
+        }
+        Ok(file)
     }
 }
 
@@ -201,5 +262,56 @@ mod tests {
         assert_eq!(std::fs::read(&target_file).unwrap(), b"content-1");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    #[test]
+    fn source_replacement_and_symlink_changes_are_rejected() {
+        let dir = std::env::temp_dir().join(format!("loconv-identity-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let source = dir.join("synthetic");
+        std::fs::write(&source, b"synthetic").unwrap();
+        let identity = SourceIdentity::capture(&std::fs::metadata(&source).unwrap()).unwrap();
+        assert!(identity.open(&source).is_ok());
+        std::fs::rename(&source, dir.join("preserved")).unwrap();
+        std::fs::write(&source, b"synthetic").unwrap();
+        assert!(identity.open(&source).is_err());
+        std::fs::remove_file(&source).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.join("preserved"), &source).unwrap();
+            assert!(identity.open(&source).is_err());
+        }
+        assert_eq!(std::fs::read(dir.join("preserved")).unwrap(), b"synthetic");
+        assert!(cleanup_temp(&dir).is_err()); // Cannot silently claim cleanup of a directory.
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn publication_rejects_dangling_symlinks_and_hardlink_conflicts() {
+        let dir = std::env::temp_dir().join(format!("loconv-publish-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let target = dir.join("target");
+        let source = dir.join("original");
+        let temp = dir.join("owned");
+        std::fs::write(&source, b"original").unwrap();
+        std::fs::hard_link(&source, &target).unwrap();
+        std::fs::write(&temp, b"converted").unwrap();
+        assert!(atomic_publish_no_overwrite(&temp, &target).is_err());
+        assert_eq!(std::fs::read(&source).unwrap(), b"original");
+        std::fs::remove_file(&target).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.join("missing"), &target).unwrap();
+            std::fs::write(&temp, b"converted").unwrap();
+            assert!(atomic_publish_no_overwrite(&temp, &target).is_err());
+            assert!(std::fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

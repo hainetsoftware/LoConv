@@ -396,6 +396,40 @@ pub fn convert_image(
     target_format: SupportedImageFormat,
     cancel_flag: &AtomicBool,
 ) -> EngineResult<()> {
+    convert_image_impl(
+        input_path,
+        temp_output_path,
+        target_format,
+        cancel_flag,
+        None,
+    )
+}
+
+/// Encode into an exclusively created file owned by the queue worker.
+pub fn convert_image_to_file(
+    input_path: &Path,
+    temp_output_path: &Path,
+    format: &loconv_contracts::FormatId,
+    cancel_flag: &AtomicBool,
+    output: File,
+) -> EngineResult<()> {
+    let target = SupportedImageFormat::try_from(format)?;
+    convert_image_impl(
+        input_path,
+        temp_output_path,
+        target,
+        cancel_flag,
+        Some(output),
+    )
+}
+
+fn convert_image_impl(
+    input_path: &Path,
+    temp_output_path: &Path,
+    target_format: SupportedImageFormat,
+    cancel_flag: &AtomicBool,
+    output: Option<File>,
+) -> EngineResult<()> {
     if cancel_flag.load(Ordering::SeqCst) {
         return Err(errors::internal());
     }
@@ -440,11 +474,14 @@ pub fn convert_image(
     }
 
     // 4. Encode to the safe temporary file
-    let temp_file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(temp_output_path)
-        .map_err(|_| errors::internal())?;
+    let temp_file = match output {
+        Some(file) => file,
+        None => std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(temp_output_path)
+            .map_err(|_| errors::internal())?,
+    };
 
     let mut writer = BufWriter::new(temp_file);
     let (buf_width, buf_height) = processed.dimensions();

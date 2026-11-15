@@ -1,8 +1,14 @@
-//! Fixed, bounded FFprobe execution. No shell, PATH lookup or output URLs.
+//! Trusted, fixed audio commands and bounded FFprobe execution.
+#[path = "ffmpeg_audio.rs"]
+mod audio;
+#[cfg(unix)]
+#[path = "ffmpeg_process.rs"]
+mod process;
 use crate::{
     errors::{self, EngineResult},
     inspection::{MAX_PROBE_STDOUT_BYTES, MAX_TRANSIENT_STDERR_BYTES, PROBE_DEADLINE},
 };
+pub use audio::AudioRequest;
 use loconv_contracts::{MediaKind, StreamInfo};
 use sha2::{Digest, Sha256};
 use std::{
@@ -17,7 +23,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Encoding is deliberately unavailable until Sprint 05B.
+/// Unconfigured registry defaults fail closed; session descriptors use a trusted handle.
 pub const fn available() -> bool {
     false
 }
@@ -33,16 +39,23 @@ pub enum Tool {
     Ffmpeg,
 }
 
-/// Verified executable infrastructure for later fixed FFmpeg encoding commands.
+/// Verified executable and capabilities for fixed FFmpeg audio encoding commands.
 /// No generic execution method is exposed.
 #[derive(Debug, Clone)]
 pub struct TrustedFfmpeg {
-    _executable: TrustedProbe,
+    executable: TrustedProbe,
+    capabilities: audio::Capabilities,
 }
 impl TrustedFfmpeg {
     pub fn resolve(resources: &Path) -> EngineResult<Self> {
+        if !cfg!(target_os = "macos") {
+            return Err(errors::tool_unavailable());
+        }
+        let executable = TrustedProbe::resolve_tool(resources, Tool::Ffmpeg)?;
+        let capabilities = audio::discover(&executable)?;
         Ok(Self {
-            _executable: TrustedProbe::resolve_tool(resources, Tool::Ffmpeg)?,
+            executable,
+            capabilities,
         })
     }
 }
@@ -143,15 +156,25 @@ impl TrustedProbe {
     }
 
     pub(crate) fn inspect(&self, file: File, demuxer: &'static str) -> EngineResult<AudioDetails> {
+        self.inspect_cancellable(file, demuxer, None)
+    }
+
+    fn inspect_cancellable(
+        &self,
+        file: File,
+        demuxer: &'static str,
+        cancel: Option<&AtomicBool>,
+    ) -> EngineResult<AudioDetails> {
         Self::verified(&self.path, &self.digest)?;
         // Discover enabled demuxers from this executable instead of assuming a build.
-        let caps = run(
+        let caps = run_cancellable(
             &self.path,
             &["-v", "error", "-demuxers"],
             None,
             PROBE_DEADLINE,
             MAX_PROBE_STDOUT_BYTES,
             MAX_TRANSIENT_STDERR_BYTES,
+            cancel,
         )?;
         if !String::from_utf8_lossy(&caps).lines().any(|line| {
             let mut cols = line.split_whitespace();
@@ -159,13 +182,14 @@ impl TrustedProbe {
         }) {
             return Err(errors::tool_unavailable());
         }
-        let bytes = run(
+        let bytes = run_cancellable(
             &self.path,
             &probe_args(demuxer),
             Some(file),
             PROBE_DEADLINE,
             MAX_PROBE_STDOUT_BYTES,
             MAX_TRANSIENT_STDERR_BYTES,
+            cancel,
         )?;
         normalize(&bytes, demuxer)
     }
@@ -208,6 +232,26 @@ fn run(
     stdout_limit: usize,
     stderr_limit: usize,
 ) -> EngineResult<Vec<u8>> {
+    run_cancellable(
+        path,
+        args,
+        input,
+        deadline,
+        stdout_limit,
+        stderr_limit,
+        None,
+    )
+}
+
+fn run_cancellable(
+    path: &Path,
+    args: &[&str],
+    input: Option<File>,
+    deadline: Duration,
+    stdout_limit: usize,
+    stderr_limit: usize,
+    cancel: Option<&AtomicBool>,
+) -> EngineResult<Vec<u8>> {
     let mut command = Command::new(path);
     command
         .args(args)
@@ -241,7 +285,7 @@ fn run(
         if exceeded.load(Ordering::SeqCst) {
             break Err(errors::resource_limit());
         }
-        if start.elapsed() >= deadline {
+        if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) || start.elapsed() >= deadline {
             break Err(errors::inspection_failed());
         }
         match child.try_wait() {

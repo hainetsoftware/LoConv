@@ -77,9 +77,15 @@ fn get_api_version(request: Request<'_>) -> EngineResult<u32> {
 }
 
 #[tauri::command]
-fn list_formats(request: Request<'_>) -> EngineResult<Vec<FormatDescriptor>> {
+fn list_formats(
+    request: Request<'_>,
+    state: State<'_, NativeState>,
+) -> EngineResult<Vec<FormatDescriptor>> {
     args::<Empty>(&request)?;
-    Ok(loconv_engine::formats::descriptors())
+    let session = state.session.lock().map_err(|_| errors::internal())?;
+    Ok(loconv_engine::formats::descriptors_with_audio(
+        session.encoder.as_ref().filter(|_| session.probe.is_some()),
+    ))
 }
 
 #[tauri::command]
@@ -131,7 +137,7 @@ fn trigger_queue_worker<R: tauri::Runtime>(state: &NativeState, app: tauri::AppH
                         Some(r) => r,
                         None => break,
                     };
-                    job.progress = Some(0.0);
+                    job.progress = None;
                     session.jobs.update(job.clone());
 
                     if let Ok(mut tokens) = active_tokens.lock() {
@@ -141,13 +147,22 @@ fn trigger_queue_worker<R: tauri::Runtime>(state: &NativeState, app: tauri::AppH
                     let input = session.inputs.get(&job.media_id).cloned();
                     let dest = session.job_destinations.get(&job.job_id).cloned();
 
-                    (Some(job), input, dest)
+                    (
+                        Some(job),
+                        input,
+                        dest,
+                        session.encoder.clone(),
+                        session.probe.clone(),
+                    )
                 } else {
-                    (None, None, None)
+                    // Release the worker gate while holding the same lock used by enqueue.
+                    // A subsequent enqueue must either be seen here or start a new worker.
+                    is_processing.store(false, Ordering::SeqCst);
+                    return;
                 }
             };
 
-            let (Some(job), Some(input), Some(dest)) = next_work else {
+            let (Some(job), Some(input), Some(dest), encoder, probe) = next_work else {
                 break;
             };
 
@@ -169,12 +184,73 @@ fn trigger_queue_worker<R: tauri::Runtime>(state: &NativeState, app: tauri::AppH
             let format_id = job.format_id.clone();
             let temp_path_for_worker = temp_target_path.clone();
 
+            let temp_owned = Arc::new(AtomicBool::new(false));
+            let worker_owned = temp_owned.clone();
+            let progress_session = session_arc.clone();
+            let progress_app = app.clone();
+            let progress_id = job.job_id.clone();
             let run_res = tauri::async_runtime::spawn_blocking(move || {
-                loconv_engine::backends::image::convert_image_by_format_id(
-                    &input_path,
-                    &temp_path_for_worker,
-                    &format_id,
-                    &cancel_flag,
+                let source = input.identity.open(&input_path)?;
+                let mut options = std::fs::OpenOptions::new();
+                options.read(true).write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                let output = options
+                    .open(&temp_path_for_worker)
+                    .map_err(|_| errors::conversion_failed())?;
+                worker_owned.store(true, Ordering::SeqCst);
+                let verification = output.try_clone().map_err(|_| errors::internal())?;
+                if input.inspection.kind == MediaKind::Audio {
+                    let encoder = encoder.ok_or_else(errors::tool_unavailable)?;
+                    let probe = probe.ok_or_else(errors::tool_unavailable)?;
+                    encoder.convert_to_file(
+                        loconv_engine::backends::ffmpeg::AudioRequest {
+                            input: source,
+                            output: &temp_path_for_worker,
+                            inspection: &input.inspection,
+                            format: &format_id,
+                            probe: &probe,
+                            cancel: &cancel_flag,
+                        },
+                        output,
+                        move |value| {
+                            if let Ok(mut session) = progress_session.lock() {
+                                if let Some(mut current) = session.jobs.get(&progress_id).cloned() {
+                                    if current.state == JobState::Running
+                                        && current.progress.is_none_or(|v| value > v)
+                                    {
+                                        current.progress = Some(value);
+                                        current.revision += 1;
+                                        session.jobs.update(current.clone());
+                                        let _ = progress_app.emit_to(
+                                            "main",
+                                            "loconv://job-changed",
+                                            JobEvent {
+                                                api_version: API_VERSION,
+                                                job: current,
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                        },
+                    )
+                } else {
+                    loconv_engine::backends::image::convert_image_to_file(
+                        &input_path,
+                        &temp_path_for_worker,
+                        &format_id,
+                        &cancel_flag,
+                        output,
+                    )
+                }?;
+                paths::SourceIdentity::capture(
+                    &verification
+                        .metadata()
+                        .map_err(|_| errors::conversion_failed())?,
                 )
             })
             .await;
@@ -206,54 +282,51 @@ fn trigger_queue_worker<R: tauri::Runtime>(state: &NativeState, app: tauri::AppH
 
                 let mut current = session.jobs.get(&job.job_id).cloned().unwrap_or(job);
 
-                if current.state == JobState::Cancelling || cancel_token.load(Ordering::SeqCst) {
-                    let _ = std::fs::remove_file(&temp_target_path);
-                    current.state = JobState::Cancelled;
-                    current.revision = current.revision.checked_add(1).unwrap_or(current.revision);
-                    current.progress = None;
-                    current.error = None;
-                } else if !loconv_engine::jobs::is_terminal(&current.state) {
-                    match run_res {
-                        Ok(Ok(())) => {
-                            match paths::atomic_publish_no_overwrite(
-                                &temp_target_path,
-                                &final_target_path,
-                            ) {
-                                Ok(()) => {
-                                    current.state = JobState::Succeeded;
-                                    current.revision =
-                                        current.revision.checked_add(1).unwrap_or(current.revision);
-                                    current.progress = Some(1.0);
-                                    current.error = None;
-                                }
-                                Err(err) => {
-                                    current.state = JobState::Failed;
-                                    current.revision =
-                                        current.revision.checked_add(1).unwrap_or(current.revision);
-                                    current.progress = None;
-                                    current.error = Some(err);
-                                }
-                            }
+                if !loconv_engine::jobs::is_terminal(&current.state) {
+                    let cancelled = current.state == JobState::Cancelling
+                        || cancel_token.load(Ordering::SeqCst);
+                    let result = match run_res {
+                        Ok(result) => result,
+                        Err(_) => Err(errors::internal()),
+                    };
+                    let cleanup = || {
+                        if temp_owned.load(Ordering::SeqCst) {
+                            paths::cleanup_temp(&temp_target_path)
+                        } else {
+                            Ok(())
                         }
-                        Ok(Err(err)) => {
-                            let _ = std::fs::remove_file(&temp_target_path);
+                    };
+                    let result = if cancelled {
+                        cleanup()
+                    } else {
+                        match result {
+                            Ok(identity) => match identity.open(&temp_target_path) {
+                                Ok(_) => paths::atomic_publish_no_overwrite(
+                                    &temp_target_path,
+                                    &final_target_path,
+                                ),
+                                Err(err) => cleanup().and(Err(err)),
+                            },
+                            Err(err) => cleanup().and(Err(err)),
+                        }
+                    };
+                    current.revision += 1;
+                    current.progress = None;
+                    match result {
+                        Ok(()) if cancelled => {
+                            current.state = JobState::Cancelled;
+                            current.error = None;
+                        }
+                        Ok(()) => {
+                            current.state = JobState::Succeeded;
+                            current.progress = Some(1.0);
+                            current.error = None;
+                        }
+                        Err(err) => {
                             current.state = JobState::Failed;
-                            current.revision =
-                                current.revision.checked_add(1).unwrap_or(current.revision);
-                            current.progress = None;
                             current.error = Some(err);
                         }
-                        Err(_) => {
-                            let _ = std::fs::remove_file(&temp_target_path);
-                            current.state = JobState::Failed;
-                            current.revision =
-                                current.revision.checked_add(1).unwrap_or(current.revision);
-                            current.progress = None;
-                            current.error = Some(errors::internal());
-                        }
                     }
-                } else {
-                    let _ = std::fs::remove_file(&temp_target_path);
                 }
 
                 session.jobs.update(current.clone());
@@ -339,7 +412,12 @@ fn cancel_job<R: tauri::Runtime>(
     }
 
     if job.state == JobState::Running {
-        if let Some(token) = state.active_tokens.lock().unwrap().get(&payload.job_id) {
+        if let Some(token) = state
+            .active_tokens
+            .lock()
+            .map_err(|_| errors::internal())?
+            .get(&payload.job_id)
+        {
             token.store(true, Ordering::SeqCst);
         }
         let updated = session.jobs.cancel(&payload.job_id)?;
@@ -452,8 +530,11 @@ fn configure<R: tauri::Runtime>(
         .setup(|app| {
             if let Ok(resources) = app.path().resource_dir() {
                 let probe = loconv_engine::backends::ffmpeg::TrustedProbe::resolve(&resources).ok();
+                let encoder =
+                    loconv_engine::backends::ffmpeg::TrustedFfmpeg::resolve(&resources).ok();
                 if let Ok(mut session) = app.state::<NativeState>().session.lock() {
                     session.probe = probe;
+                    session.encoder = encoder;
                 }
             }
             Ok(())
