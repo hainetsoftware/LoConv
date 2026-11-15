@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-get-api-version"
+description = "Allows the main window to read the LoConv IPC version."
+commands.allow = ["get_api_version"]
