@@ -7,3 +7,4 @@ publish = false
 
 [dependencies]
 loconv-contracts = { path = "../contracts" }
+uuid = { version = "1", features = ["v4"] }

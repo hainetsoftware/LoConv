@@ -1,6 +1,13 @@
 {
   "identifier": "main-capability",
-  "description": "Only the main LoConv window may read the IPC version in this increment.",
-  "windows": ["main"],
-  "permissions": ["allow-get-api-version"]
+  "description": "Local main-window IPC v1 and event subscriptions; no general filesystem or process access.",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "allow-get-api-version",
+    "allow-ipc-v1",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ]
 }

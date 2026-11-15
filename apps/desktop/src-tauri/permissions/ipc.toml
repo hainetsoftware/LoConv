@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-ipc-v1"
+description = "Allows the local main window to use the bounded LoConv IPC v1 commands."
+commands.allow = ["select_inputs", "import_dropped_inputs", "select_destination", "list_formats", "enqueue_job", "list_jobs", "cancel_job"]
