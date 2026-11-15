@@ -1,0 +1,17 @@
+{
+  "apiVersion": 1,
+  "job": {
+    "jobId": "synthetic-job-1",
+    "mediaId": "synthetic-media-1",
+    "formatId": "mp3",
+    "outputName": "synthetic-tone.mp3",
+    "state": "failed",
+    "revision": 3,
+    "progress": null,
+    "error": {
+      "code": "tool_unavailable",
+      "message": "Required local tool is unavailable.",
+      "retryable": false
+    }
+  }
+}

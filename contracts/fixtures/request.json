@@ -1,0 +1,6 @@
+{
+  "mediaId": "synthetic-media-1",
+  "destinationId": "synthetic-destination-1",
+  "outputName": "synthetic-tone.mp3",
+  "formatId": "mp3"
+}

@@ -1,0 +1,9 @@
+[
+  {"id":"mp4_h264_aac","label":"MP4 (H.264/AAC)","extension":"mp4","inputKinds":["video"],"backend":"ffmpeg","available":false,"unavailableReason":"tool_unavailable"},
+  {"id":"webm_vp9_opus","label":"WebM (VP9/Opus)","extension":"webm","inputKinds":["video"],"backend":"ffmpeg","available":false,"unavailableReason":"tool_unavailable"},
+  {"id":"mp3","label":"MP3","extension":"mp3","inputKinds":["audio","video"],"backend":"ffmpeg","available":false,"unavailableReason":"tool_unavailable"},
+  {"id":"wav_pcm16","label":"WAV (PCM 16-bit)","extension":"wav","inputKinds":["audio","video"],"backend":"ffmpeg","available":false,"unavailableReason":"tool_unavailable"},
+  {"id":"png","label":"PNG","extension":"png","inputKinds":["image"],"backend":"image","available":true,"unavailableReason":null},
+  {"id":"jpeg","label":"JPEG","extension":"jpg","inputKinds":["image"],"backend":"image","available":true,"unavailableReason":null},
+  {"id":"webp","label":"WebP (lossless)","extension":"webp","inputKinds":["image"],"backend":"image","available":true,"unavailableReason":null}
+]

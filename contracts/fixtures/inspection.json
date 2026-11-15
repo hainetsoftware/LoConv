@@ -1,0 +1,12 @@
+{
+  "mediaId": "synthetic-media-1",
+  "displayName": "synthetic-tone.wav",
+  "kind": "audio",
+  "sizeBytes": "9007199254740993",
+  "durationMs": 1000.0,
+  "container": "wav",
+  "streams": [{
+    "index": 0, "kind": "audio", "codec": "pcm_s16le",
+    "width": null, "height": null, "sampleRateHz": 48000, "channels": 1
+  }]
+}
