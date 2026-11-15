@@ -180,23 +180,64 @@ class Orchestrator:
                     **creation)
                 self.running[task.id] = proc
                 logpath = self.logs / f"{task.id}.log"
-                with logpath.open("a", encoding="utf-8") as logfile:
-                    logfile.write(f"\n[{utcnow()}] {task.agent} started\n")
+                # Stream output in bounded chunks. JSONL tools such as OpenCode can
+                # emit individual lines much larger than asyncio's readline limit.
+                # Persist raw bytes, but retain only a small per-line preview in RAM.
+                preview = bytearray()
+                preview_limit = 4096
+                line_bytes = 0
+                reported_failure = None
+
+                def report_line() -> None:
+                    nonlocal line_bytes, reported_failure
+                    if not line_bytes:
+                        return
+                    decoded = preview.decode("utf-8", errors="replace").rstrip()
+                    # Cline can return process exit code 0 despite aborting its task.
+                    if task.agent == "cline" and line_bytes <= preview_limit:
+                        try:
+                            event = json.loads(decoded)
+                            if event.get("type") == "run_result":
+                                reason = event.get("finishReason")
+                                if reason not in (None, "completed", "success"):
+                                    reported_failure = f"Cline finishReason: {reason}"
+                            elif event.get("type") == "agent_event":
+                                nested = event.get("event", {})
+                                if nested.get("type") == "done" and nested.get("reason") in ("aborted", "failed", "error"):
+                                    reported_failure = f"Cline agent: {nested['reason']}"
+                        except (ValueError, TypeError, AttributeError):
+                            pass
+                    if line_bytes > 800:
+                        decoded = decoded[:800] + "… [long line; full output in log]"
+                    self.emit(task.id, decoded)
+                    preview.clear()
+                    line_bytes = 0
+
+                with logpath.open("ab") as logfile:
+                    logfile.write(f"\n[{utcnow()}] {task.agent} started\n".encode())
                     assert proc.stdout is not None
                     while True:
-                        line = await proc.stdout.readline()
-                        if not line:
+                        chunk = await proc.stdout.read(64 * 1024)
+                        if not chunk:
                             break
-                        decoded = line.decode("utf-8", errors="replace").rstrip()
-                        logfile.write(decoded + "\n")
+                        logfile.write(chunk)
                         logfile.flush()
-                        if len(decoded) > 800:
-                            decoded = decoded[:800] + "…"
-                        self.emit(task.id, decoded)
+                        # Never retain arbitrarily large JSONL events in memory.
+                        for segment in chunk.splitlines(keepends=True):
+                            remaining = max(0, preview_limit - len(preview))
+                            if remaining:
+                                preview.extend(segment[:remaining])
+                            line_bytes += len(segment)
+                            if segment.endswith((b"\n", b"\r")):
+                                report_line()
+                    report_line()  # Handle final line without trailing newline.
                 await proc.wait()
                 task.exit_code = proc.returncode
                 if task.status != "cancelled":
-                    task.status = "completed" if proc.returncode == 0 else "failed"
+                    task.status = "completed" if proc.returncode == 0 and not reported_failure else "failed"
+                    if reported_failure:
+                        task.note = reported_failure
+                        self.emit(task.id, f"ERROR: {reported_failure}")
                 self.emit(task.id, f"Process exited with code {proc.returncode}")
             except asyncio.CancelledError:
                 task.status = "cancelled"
