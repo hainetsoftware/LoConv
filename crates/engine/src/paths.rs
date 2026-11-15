@@ -4,6 +4,8 @@
 //! mount locality are validated by later host increments. These rules reject
 //! basename injection before any path is joined or opened.
 
+use std::path::Path;
+
 use crate::errors::{self, EngineResult};
 
 /// Maximum UTF-8 bytes for an output basename, matching the architecture limit.
@@ -57,6 +59,56 @@ pub fn validate_output_name(name: &str, expected_extension: &str) -> EngineResul
     } else {
         Err(errors::invalid_request())
     }
+}
+
+/// Atomically publish a temporary file to its final destination without overwriting.
+///
+/// Ensures the target does not already exist, creates a hard link to `final_path`,
+/// and unlinks `temp_path`. If `final_path` exists, fails with `OutputConflict`
+/// and cleans up `temp_path`.
+pub fn atomic_publish_no_overwrite(temp_path: &Path, final_path: &Path) -> EngineResult<()> {
+    if final_path.exists() {
+        let _ = std::fs::remove_file(temp_path);
+        return Err(errors::output_conflict());
+    }
+
+    match std::fs::hard_link(temp_path, final_path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(temp_path);
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(temp_path);
+            Err(errors::output_conflict())
+        }
+        Err(_) => {
+            let _ = std::fs::remove_file(temp_path);
+            Err(errors::internal())
+        }
+    }
+}
+
+/// Check if a path is on a local mount rather than a network/remote mount.
+#[cfg(target_os = "macos")]
+pub fn is_local_path(path: &Path) -> bool {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    let Ok(canonical) = path.canonicalize() else {
+        return false;
+    };
+    let Ok(cpath) = CString::new(canonical.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    unsafe {
+        libc::statfs(cpath.as_ptr(), stat.as_mut_ptr()) == 0
+            && stat.assume_init().f_flags & libc::MNT_LOCAL as u32 != 0
+    }
+}
+
+/// Check if a path is on a local mount rather than a network/remote mount.
+#[cfg(not(target_os = "macos"))]
+pub fn is_local_path(_path: &Path) -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -120,5 +172,34 @@ mod tests {
 
         let too_long = format!("{}.mp4", "a".repeat(MAX_OUTPUT_NAME_BYTES));
         assert_rejected(&too_long, "mp4");
+    }
+
+    #[test]
+    fn atomic_publish_no_overwrite_publishes_and_prevents_overwrite() {
+        let temp_dir = std::env::temp_dir().join(format!("loconv-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let temp_file = temp_dir.join("tmp-1.tmp");
+        let target_file = temp_dir.join("output.jpg");
+
+        std::fs::write(&temp_file, b"content-1").unwrap();
+
+        // 1. First publish succeeds
+        assert!(atomic_publish_no_overwrite(&temp_file, &target_file).is_ok());
+        assert!(!temp_file.exists());
+        assert_eq!(std::fs::read(&target_file).unwrap(), b"content-1");
+
+        // 2. Second publish to existing target fails with OutputConflict
+        let temp_file_2 = temp_dir.join("tmp-2.tmp");
+        std::fs::write(&temp_file_2, b"content-2").unwrap();
+
+        let err = atomic_publish_no_overwrite(&temp_file_2, &target_file).unwrap_err();
+        assert_eq!(err.code, ErrorCode::OutputConflict);
+        // temp file cleaned up
+        assert!(!temp_file_2.exists());
+        // original target is preserved byte-for-byte!
+        assert_eq!(std::fs::read(&target_file).unwrap(), b"content-1");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

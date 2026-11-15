@@ -6,5 +6,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+image = { version = "0.25.9", default-features = false, features = ["png", "jpeg", "webp"] }
+libc = "0.2"
 loconv-contracts = { path = "../contracts" }
 uuid = { version = "1", features = ["v4"] }

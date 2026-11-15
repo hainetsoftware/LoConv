@@ -1,4 +1,6 @@
-import React, { useCallback, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
+import { getCurrentWindow } from '@tauri-apps/api/window';
+import { isTauri } from '@tauri-apps/api/core';
 
 interface DropZoneProps {
   onSelectFiles: () => void;
@@ -12,6 +14,54 @@ export const DropZone: React.FC<DropZoneProps> = ({
   disabled = false,
 }) => {
   const [isDragActive, setIsDragActive] = useState(false);
+
+  // Subscribe to native Tauri 2 window drag-drop events on macOS/desktop
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let isCancelled = false;
+
+    const inTauri =
+      typeof window !== 'undefined' && (isTauri() || '__TAURI_INTERNALS__' in window);
+
+    if (inTauri) {
+      try {
+        getCurrentWindow()
+          .onDragDropEvent((event) => {
+            if (isCancelled || disabled) return;
+            const payload = event.payload;
+            if (payload.type === 'enter') {
+              setIsDragActive(true);
+            } else if (payload.type === 'leave') {
+              setIsDragActive(false);
+            } else if (payload.type === 'drop') {
+              setIsDragActive(false);
+              if (payload.paths && payload.paths.length > 0) {
+                onDropPaths(payload.paths);
+              }
+            }
+          })
+          .then((unlistenFn) => {
+            if (isCancelled) {
+              unlistenFn();
+            } else {
+              unlisten = unlistenFn;
+            }
+          })
+          .catch(() => {
+            // Safe fallback if window event subscription fails
+          });
+      } catch {
+        // Safe fallback in mock/browser environments
+      }
+    }
+
+    return () => {
+      isCancelled = true;
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  }, [disabled, onDropPaths]);
 
   const handleDragOver = useCallback(
     (e: React.DragEvent) => {
