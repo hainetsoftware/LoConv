@@ -1783,6 +1783,8 @@ dependencies = [
  "image",
  "libc",
  "loconv-contracts",
+ "serde_json",
+ "sha2",
  "uuid",
 ]
 

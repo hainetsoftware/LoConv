@@ -34,5 +34,7 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 tauri = { version = "2", features = ["test"] }
 
 [features]
+# Requires debug build plus explicit environment opt-in and SHA-256 pin.
+dev-tools = ["loconv-engine/dev-tools"]
 # Enabled by the Tauri CLI for release builds so bundled assets are embedded.
 custom-protocol = ["tauri/custom-protocol"]

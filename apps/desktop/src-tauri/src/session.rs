@@ -21,6 +21,7 @@ pub struct InputRecord {
 
 #[derive(Default)]
 pub struct Session {
+    pub probe: Option<loconv_engine::backends::ffmpeg::TrustedProbe>,
     pub inputs: HashMap<String, InputRecord>,
     pub destinations: HashMap<String, PathBuf>,
     pub jobs: loconv_engine::jobs::JobRegistry,
@@ -75,7 +76,7 @@ impl Session {
         let mut staged: Vec<InputRecord> = Vec::with_capacity(paths.len());
         for path_str in &paths {
             let path = Path::new(path_str);
-            let inspection = inspection::inspect_local_file(path)?;
+            let inspection = inspection::inspect_local_file_with_probe(path, self.probe.as_ref())?;
             let meta = std::fs::symlink_metadata(path).map_err(|_| errors::inspection_failed())?;
             let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
             staged.push(InputRecord {

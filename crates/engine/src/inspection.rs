@@ -1,7 +1,4 @@
-//! Inspection limits and local media inspection.
-//!
-//! Performs bounded inspection of PNG, JPEG, and WebP images using the Rust `image`
-//! crate. Rejects animated, oversized, or unsupported inputs safely without leaking paths.
+//! Bounded local still-image and trusted FFprobe audio inspection.
 
 use std::path::Path;
 use std::time::Duration;
@@ -57,6 +54,14 @@ pub fn validate_selection_path_syntax(path: &Path) -> EngineResult<()> {
 
 /// Safely inspect a local file, detecting media type from contents rather than extension.
 pub fn inspect_local_file(path: &Path) -> EngineResult<InputInspection> {
+    inspect_local_file_with_probe(path, None)
+}
+
+/// Shared native picker/drop inspection with a host-resolved trusted probe.
+pub fn inspect_local_file_with_probe(
+    path: &Path,
+    probe: Option<&backends::ffmpeg::TrustedProbe>,
+) -> EngineResult<InputInspection> {
     validate_selection_path_syntax(path)?;
 
     let metadata = std::fs::symlink_metadata(path).map_err(|_| errors::inspection_failed())?;
@@ -76,6 +81,57 @@ pub fn inspect_local_file(path: &Path) -> EngineResult<InputInspection> {
         return Err(errors::resource_limit());
     }
 
+    // Read only a bounded signature; extensions never select a demuxer.
+    use std::io::{Read, Seek};
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Do not follow a replaced symlink or block on a substituted FIFO.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|_| errors::inspection_failed())?;
+    let opened = file.metadata().map_err(|_| errors::inspection_failed())?;
+    if !opened.is_file() || opened.len() != len {
+        return Err(errors::inspection_failed());
+    }
+    let mut signature = [0; 12];
+    let n = file
+        .read(&mut signature)
+        .map_err(|_| errors::inspection_failed())?;
+    let sig = &signature[..n];
+    let demuxer = if sig.starts_with(b"RIFF") && sig.get(8..12) == Some(b"WAVE") {
+        Some("wav")
+    } else if sig.starts_with(b"fLaC") {
+        Some("flac")
+    } else if sig.starts_with(b"OggS") {
+        Some("ogg")
+    } else if sig.starts_with(b"ID3") || (n >= 2 && sig[0] == 0xff && sig[1] & 0xe0 == 0xe0) {
+        Some("mp3")
+    } else {
+        None
+    };
+    if let Some(demuxer) = demuxer {
+        let probe = probe.ok_or_else(errors::tool_unavailable)?;
+        file.rewind().map_err(|_| errors::inspection_failed())?;
+        let details = probe.inspect(file, demuxer)?;
+        return Ok(InputInspection {
+            media_id: uuid::Uuid::new_v4().to_string(),
+            display_name: path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("audio")
+                .to_owned(),
+            kind: MediaKind::Audio,
+            size_bytes: len.to_string(),
+            duration_ms: details.duration_ms,
+            container: details.container,
+            streams: details.streams,
+        });
+    }
     let details = backends::image::inspect_image_file(path)?;
 
     let display_name = path
@@ -105,7 +161,7 @@ pub fn inspect_local_file(path: &Path) -> EngineResult<InputInspection> {
     })
 }
 
-/// Local media inspector for still images.
+/// Image-only inspector when no trusted probe has been configured.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LocalInspector;
 
@@ -179,6 +235,53 @@ mod tests {
         assert_eq!(err.code, ErrorCode::UnsupportedInput);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_urls_and_protocols_before_io() {
+        for path in [
+            "https://example.invalid/a",
+            "http://example.invalid/a",
+            "file:/a",
+            "concat:a|b",
+            "pipe:0",
+            "data:audio/wav,a",
+            "ftp://example.invalid/a",
+            "//remote/a",
+            "relative.wav",
+        ] {
+            assert_eq!(
+                inspect_local_file(Path::new(path)).unwrap_err().code,
+                ErrorCode::InvalidRequest
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn playlists_and_missing_probe_fail_closed() {
+        let dir =
+            std::env::temp_dir().join(format!("loconv-audio-reject-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("invented.wav");
+        for bytes in [
+            b"#EXTM3U\nhttps://example.invalid/secret".as_slice(),
+            b"ffconcat version 1.0\nfile '/private/invented'",
+            b"<MPD><BaseURL>https://example.invalid/</BaseURL></MPD>",
+            b"#!/bin/sh\necho invented",
+        ] {
+            std::fs::write(&path, bytes).unwrap();
+            assert_eq!(
+                inspect_local_file(&path).unwrap_err().code,
+                ErrorCode::UnsupportedInput
+            );
+        }
+        std::fs::write(&path, b"RIFF0000WAVE").unwrap();
+        assert_eq!(
+            inspect_local_file(&path).unwrap_err().code,
+            ErrorCode::ToolUnavailable
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

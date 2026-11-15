@@ -16,7 +16,7 @@ use std::{
 };
 use tauri::{
     ipc::{InvokeBody, Request},
-    Emitter, State,
+    Emitter, Manager, State,
 };
 
 struct NativeState {
@@ -363,16 +363,26 @@ fn cancel_job<R: tauri::Runtime>(
 }
 
 #[tauri::command]
-fn import_dropped_inputs(
+async fn import_dropped_inputs(
     request: Request<'_>,
     state: State<'_, NativeState>,
 ) -> EngineResult<Vec<InputInspection>> {
     let payload: Dropped = args(&request)?;
-    state
-        .session
-        .lock()
-        .map_err(|_| errors::internal())?
-        .import(payload.paths)
+    import_paths(state.session.clone(), payload.paths).await
+}
+
+async fn import_paths(
+    session: Arc<Mutex<session::Session>>,
+    paths: Vec<String>,
+) -> EngineResult<Vec<InputInspection>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        session
+            .lock()
+            .map_err(|_| errors::internal())?
+            .import(paths)
+    })
+    .await
+    .map_err(|_| errors::internal())?
 }
 
 async fn choose<R: tauri::Runtime>(
@@ -406,11 +416,7 @@ async fn select_inputs<R: tauri::Runtime>(
                 .map_err(|_| errors::invalid_request())
         })
         .collect::<EngineResult<Vec<_>>>()?;
-    state
-        .session
-        .lock()
-        .map_err(|_| errors::internal())?
-        .import(paths)
+    import_paths(state.session.clone(), paths).await
 }
 
 #[tauri::command]
@@ -443,6 +449,15 @@ fn configure<R: tauri::Runtime>(
 ) -> tauri::Builder<R> {
     builder
         .manage(state)
+        .setup(|app| {
+            if let Ok(resources) = app.path().resource_dir() {
+                let probe = loconv_engine::backends::ffmpeg::TrustedProbe::resolve(&resources).ok();
+                if let Ok(mut session) = app.state::<NativeState>().session.lock() {
+                    session.probe = probe;
+                }
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             get_api_version,
             select_inputs,

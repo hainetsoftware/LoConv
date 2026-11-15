@@ -809,3 +809,90 @@ fn real_synthetic_image_conversion_all_combinations_e2e() {
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
+
+#[cfg(all(debug_assertions, feature = "dev-tools", target_os = "macos"))]
+#[test]
+#[ignore = "real pinned FFprobe integration; native handlers with synthetic picker"]
+fn real_audio_picker_and_drop_inspection() {
+    let probe = loconv_engine::backends::ffmpeg::TrustedProbe::resolve(std::path::Path::new(
+        "/unused-resource-root",
+    ))
+    .unwrap();
+    let dir = std::env::temp_dir().join(format!("loconv-native-audio-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("generated.bin");
+    let mut wav = Vec::new();
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&1636u32.to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&8000u32.to_le_bytes());
+    wav.extend_from_slice(&16000u32.to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&1600u32.to_le_bytes());
+    wav.resize(1644, 0);
+    std::fs::write(&path, &wav).unwrap();
+    struct SyntheticPicker(std::path::PathBuf);
+    impl dialogs::Dialogs for SyntheticPicker {
+        fn choose(&self, directory: bool) -> EngineResult<Vec<std::path::PathBuf>> {
+            assert!(!directory);
+            Ok(vec![self.0.clone()])
+        }
+    }
+    let app = configure(
+        mock_builder(),
+        NativeState {
+            dialogs: Arc::new(SyntheticPicker(path.clone())),
+            ..Default::default()
+        },
+    )
+    .build(context())
+    .unwrap();
+    app.state::<NativeState>().session.lock().unwrap().probe = Some(probe);
+    let w = window(&app, "main");
+    for (command, body) in [
+        ("select_inputs", json!({})),
+        ("import_dropped_inputs", json!({"paths":[path]})),
+    ] {
+        let result = invoke(&w, command, body).unwrap();
+        assert_eq!(result[0]["kind"], "audio");
+        assert_eq!(result[0]["container"], "wav");
+        assert_eq!(result[0]["streams"][0]["codec"], "pcm_s16le");
+        assert_eq!(result[0]["sizeBytes"], "1644");
+        assert!(uuid::Uuid::parse_str(result[0]["mediaId"].as_str().unwrap()).is_ok());
+        code(
+            invoke(
+                &w,
+                "enqueue_job",
+                json!({"request":{"mediaId":result[0]["mediaId"], "destinationId":"unused", "formatId":"mp3", "outputName":"generated.mp3"}}),
+            ),
+            "tool_unavailable",
+        );
+    }
+    // A batch containing a playlist must register none of its staged inputs.
+    let playlist = dir.join("invented.wav");
+    std::fs::write(&playlist, b"#EXTM3U\nhttps://example.invalid/a").unwrap();
+    code(
+        invoke(
+            &w,
+            "import_dropped_inputs",
+            json!({"paths":[path, playlist]}),
+        ),
+        "unsupported_input",
+    );
+    assert_eq!(
+        app.state::<NativeState>()
+            .session
+            .lock()
+            .unwrap()
+            .inputs
+            .len(),
+        2
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), wav);
+    std::fs::remove_dir_all(dir).unwrap();
+}

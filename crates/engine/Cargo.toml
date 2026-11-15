@@ -5,7 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+# Explicit local development only; debug_assertions is also required.
+dev-tools = []
+
 [dependencies]
+serde_json = "1"
+sha2 = "0.10"
 image = { version = "0.25.9", default-features = false, features = ["png", "jpeg", "webp"] }
 libc = "0.2"
 loconv-contracts = { path = "../contracts" }
