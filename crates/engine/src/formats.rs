@@ -2,7 +2,7 @@
 //!
 //! Descriptors describe real input/output combinations. Availability is derived
 //! from backend capability, never from file extensions or optimistic defaults.
-//! Both backends are unavailable in this increment, so every entry is disabled.
+//! Images are available; FFmpeg encoding remains unavailable until Sprint 05B.
 
 use loconv_contracts::{Backend, ErrorCode, FormatDescriptor, FormatId, MediaKind};
 

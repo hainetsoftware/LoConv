@@ -1,9 +1,5 @@
-//! Offline media engine foundation.
-//!
-//! This crate currently provides only stable seams and fail-closed scaffolding.
-//! It includes bounded in-memory job snapshot storage. It does not probe media,
-//! spawn FFmpeg/FFprobe, decode images, schedule workers,
-//! or touch the network. See `ARCHITECTURE.md` for the planned increments.
+//! Offline media engine: image conversion and bounded trusted audio inspection.
+//! Audio/video encoding remains unavailable. See ARCHITECTURE.md and PRIVACY.md.
 
 pub mod backends;
 pub mod errors;
