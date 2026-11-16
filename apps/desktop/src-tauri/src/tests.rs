@@ -79,7 +79,7 @@ fn startup_and_all_commands_use_v1_ipc() {
         formats,
         serde_json::to_value(loconv_engine::formats::descriptors()).unwrap()
     );
-    assert_eq!(formats.as_array().unwrap().len(), 7);
+    assert_eq!(formats.as_array().unwrap().len(), 9);
     assert_eq!(
         formats
             .as_array()

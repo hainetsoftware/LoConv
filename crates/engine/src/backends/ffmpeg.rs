@@ -28,9 +28,24 @@ pub const fn available() -> bool {
     false
 }
 
-/// Release pins belong in source, reviewed alongside the actual packaged build.
-/// Empty until audited binaries, build configurations and licenses are supplied.
-const RELEASE_PINS: &[(&str, &str, &str, &str)] = &[];
+/// The macOS packaging script embeds pins after checking the built executables.
+/// A regular Cargo build has no packaged tools configured.
+fn package_pin(_tool: Tool) -> Option<&'static str> {
+    #[cfg(all(not(debug_assertions), target_os = "macos", target_arch = "aarch64"))]
+    return match _tool {
+        Tool::Ffmpeg => option_env!("LOCONV_PACKAGE_FFMPEG_SHA256"),
+        Tool::Ffprobe => option_env!("LOCONV_PACKAGE_FFPROBE_SHA256"),
+    };
+    #[cfg(not(all(not(debug_assertions), target_os = "macos", target_arch = "aarch64")))]
+    None
+}
+
+#[cfg(all(test, target_os = "macos", feature = "dev-tools"))]
+fn media_test_resources() -> PathBuf {
+    std::env::var_os("LOCONV_TEST_MEDIA_RESOURCES")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/unused-resource-root"))
+}
 
 /// Tool identity is fixed by Rust, never selected by UI arguments.
 #[derive(Clone, Copy)]
@@ -89,19 +104,8 @@ impl TrustedProbe {
                 .map_err(|_| errors::tool_unavailable())?;
             return Self::verified(Path::new(&path), &digest);
         }
-        let name = if cfg!(windows) {
-            format!("{base}.exe")
-        } else {
-            base.to_owned()
-        };
-        let digest = RELEASE_PINS
-            .iter()
-            .find(|(os, arch, name, _)| {
-                *os == std::env::consts::OS && *arch == std::env::consts::ARCH && *name == base
-            })
-            .map(|(_, _, _, hash)| *hash)
-            .ok_or_else(errors::tool_unavailable)?;
-        Self::verified(&resources.join("tools").join(name), digest)
+        let digest = package_pin(tool).ok_or_else(errors::tool_unavailable)?;
+        Self::verified(&resources.join("tools").join(base), digest)
     }
 
     fn verified(path: &Path, digest: &str) -> EngineResult<Self> {
@@ -199,7 +203,7 @@ impl TrustedProbe {
 }
 
 fn video_demuxer(demuxer: &str) -> bool {
-    matches!(demuxer, "mov" | "matroska")
+    matches!(demuxer, "avi" | "mov" | "matroska")
 }
 
 fn input_args(demuxer: &str) -> Vec<&str> {
@@ -378,12 +382,10 @@ fn normalize(bytes: &[u8], expected: &str) -> EngineResult<ProbeDetails> {
         serde_json::from_slice(bytes).map_err(|_| errors::inspection_failed())?;
     let format = root.get("format").ok_or_else(errors::inspection_failed)?;
     let video = video_demuxer(expected);
-    if !matches!(
-        expected,
-        "wav" | "flac" | "mp3" | "ogg" | "mov" | "matroska"
-    ) || !format["format_name"]
-        .as_str()
-        .is_some_and(|names| names.split(',').any(|name| name == expected))
+    if !(video || matches!(expected, "wav" | "flac" | "mp3" | "ogg"))
+        || !format["format_name"]
+            .as_str()
+            .is_some_and(|names| names.split(',').any(|name| name == expected))
     {
         return Err(errors::unsupported_input());
     }
@@ -411,9 +413,24 @@ fn normalize(bytes: &[u8], expected: &str) -> EngineResult<ProbeDetails> {
             .as_str()
             .ok_or_else(errors::inspection_failed)?;
         let permitted = if kind == "video" {
-            matches!(codec, "h264" | "hevc" | "mpeg4" | "vp8" | "vp9" | "av1")
-        } else if video {
-            matches!(codec, "aac" | "opus" | "vorbis" | "mp3")
+            matches!(
+                codec,
+                "h264"
+                    | "hevc"
+                    | "mpeg4"
+                    | "vp8"
+                    | "vp9"
+                    | "av1"
+                    | "mjpeg"
+                    | "mpeg1video"
+                    | "mpeg2video"
+                    | "msmpeg4v1"
+                    | "msmpeg4v2"
+                    | "msmpeg4v3"
+                    | "huffyuv"
+                    | "rawvideo"
+                    | "ffv1"
+            )
         } else {
             matches!(
                 codec,
@@ -427,7 +444,7 @@ fn normalize(bytes: &[u8], expected: &str) -> EngineResult<ProbeDetails> {
                     | "pcm_u8"
                     | "pcm_f32le"
                     | "pcm_f64le"
-            )
+            ) || (video && matches!(codec, "aac" | "ac3" | "eac3" | "dts" | "mp2"))
         };
         if !permitted {
             return Err(errors::unsupported_input());
@@ -707,11 +724,11 @@ mod tests {
         );
     }
 
-    #[cfg(all(debug_assertions, feature = "dev-tools", target_os = "macos"))]
+    #[cfg(all(feature = "dev-tools", target_os = "macos"))]
     #[test]
-    #[ignore = "real binary integration; requires explicit pinned development FFprobe"]
+    #[ignore = "requires pinned development or packaged FFprobe"]
     fn real_synthetic_wav_inspection() {
-        let probe = TrustedProbe::resolve(Path::new("/unused-resource-root")).unwrap();
+        let probe = TrustedProbe::resolve(&media_test_resources()).unwrap();
         let dir = std::env::temp_dir().join(format!("loconv-audio-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&dir).unwrap();
         // 0.1 seconds of generated silence, PCM mono 8 kHz, no metadata.

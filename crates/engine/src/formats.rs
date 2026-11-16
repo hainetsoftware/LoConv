@@ -32,6 +32,20 @@ pub const REGISTRY: &[FormatSpec] = &[
         backend: Backend::Ffmpeg,
     },
     FormatSpec {
+        id: FormatId::MkvH264Aac,
+        label: "MKV (H.264/AAC)",
+        extension: "mkv",
+        input_kinds: VIDEO_ONLY,
+        backend: Backend::Ffmpeg,
+    },
+    FormatSpec {
+        id: FormatId::AviMpeg4Mp3,
+        label: "AVI (MPEG-4/MP3)",
+        extension: "avi",
+        input_kinds: VIDEO_ONLY,
+        backend: Backend::Ffmpeg,
+    },
+    FormatSpec {
         id: FormatId::WebmVp9Opus,
         label: "WebM (VP9/Opus)",
         extension: "webm",
@@ -144,7 +158,7 @@ mod tests {
     fn registry_is_complete_and_derives_availability_from_backends() {
         let descriptors = descriptors();
         assert_eq!(descriptors.len(), REGISTRY.len());
-        assert_eq!(descriptors.len(), 7);
+        assert_eq!(descriptors.len(), 9);
 
         for descriptor in &descriptors {
             assert!(!descriptor.label.is_empty());

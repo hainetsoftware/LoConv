@@ -159,6 +159,30 @@ describe('App Desktop Frontend Component', () => {
     expect(mp3Format.closest('.format-card')).toHaveClass('disabled');
   });
 
+  it('changes the default and edited output extensions when selecting a format', async () => {
+    const enqueue = vi.spyOn(mockApi, 'enqueueJob');
+    render(<App api={mockApi} />);
+    fireEvent.click(screen.getByRole('button', { name: /\+ Add Files/i }));
+    const filename = await screen.findByRole('textbox', { name: /Output Filename/i });
+    expect(filename).toHaveValue('synthetic-landscape.mp4');
+
+    fireEvent.click(screen.getByRole('radio', { name: /MKV / }));
+    expect(filename).toHaveValue('synthetic-landscape.mkv');
+
+    fireEvent.change(filename, { target: { value: 'my.cut.v2.mkv' } });
+    fireEvent.keyDown(screen.getByRole('radio', { name: /AVI / }), { key: 'Enter' });
+    expect(filename).toHaveValue('my.cut.v2.avi');
+
+    fireEvent.click(screen.getByRole('button', { name: /Select destination directory/i }));
+    const start = screen.getByRole('button', { name: /Start Conversion/i });
+    await waitFor(() => expect(start).toBeEnabled());
+    fireEvent.click(start);
+    await waitFor(() => expect(enqueue).toHaveBeenCalledWith(expect.objectContaining({
+      outputName: 'my.cut.v2.avi',
+      formatId: 'avi_mpeg4_mp3',
+    })));
+  });
+
   it('validates output basename and disables conversion button when invalid', async () => {
     render(<App api={mockApi} />);
 

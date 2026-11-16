@@ -23,7 +23,7 @@ fn synthetic_shared_fixtures_preserve_wire_shape() {
     let formats = round_trip::<Vec<FormatDescriptor>>(include_str!(
         "../../../contracts/fixtures/formats.json"
     ));
-    assert_eq!(formats.len(), 7);
+    assert_eq!(formats.len(), 9);
 }
 
 #[test]

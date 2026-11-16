@@ -14,14 +14,16 @@ import {
 describe('Synthetic Wire Fixture Conformance', () => {
   it('validates formats.json fixture against FormatDescriptor specification', () => {
     expect(Array.isArray(formatsFixture)).toBe(true);
-    expect(formatsFixture.length).toBe(7);
+    expect(formatsFixture.length).toBe(9);
 
     const validated = formatsFixture.map(validateFormatDescriptor);
-    expect(validated.length).toBe(7);
+    expect(validated.length).toBe(9);
 
     // Verify expected formats from contract
     const ids = validated.map((f) => f.id);
     expect(ids).toContain('mp4_h264_aac');
+    expect(ids).toContain('mkv_h264_aac');
+    expect(ids).toContain('avi_mpeg4_mp3');
     expect(ids).toContain('webm_vp9_opus');
     expect(ids).toContain('mp3');
     expect(ids).toContain('wav_pcm16');

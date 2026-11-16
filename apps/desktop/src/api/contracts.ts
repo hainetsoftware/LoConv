@@ -3,7 +3,7 @@
  */
 export const API_VERSION = 1 as const;
 export type MediaKind = 'video' | 'audio' | 'image';
-export type FormatId = 'mp4_h264_aac' | 'webm_vp9_opus' | 'mp3' | 'wav_pcm16' | 'png' | 'jpeg' | 'webp';
+export type FormatId = 'mp4_h264_aac' | 'mkv_h264_aac' | 'avi_mpeg4_mp3' | 'webm_vp9_opus' | 'mp3' | 'wav_pcm16' | 'png' | 'jpeg' | 'webp';
 export type Backend = 'ffmpeg' | 'image';
 export type JobState = 'queued' | 'running' | 'cancelling' | 'succeeded' | 'failed' | 'cancelled';
 export type ErrorCode = 'invalid_request' | 'unsupported_input' | 'unsupported_format'

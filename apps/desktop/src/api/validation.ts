@@ -35,6 +35,8 @@ export const KNOWN_MEDIA_KINDS: readonly MediaKind[] = ['video', 'audio', 'image
 
 export const KNOWN_FORMAT_IDS: readonly FormatId[] = [
   'mp4_h264_aac',
+  'mkv_h264_aac',
+  'avi_mpeg4_mp3',
   'webm_vp9_opus',
   'mp3',
   'wav_pcm16',

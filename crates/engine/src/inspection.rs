@@ -1,4 +1,4 @@
-//! Bounded local still-image and trusted FFprobe audio inspection.
+//! Bounded local still-image and trusted FFprobe media inspection.
 
 use std::path::Path;
 use std::time::Duration;
@@ -105,6 +105,8 @@ pub fn inspect_local_file_with_probe(
     let sig = &signature[..n];
     let demuxer = if sig.starts_with(b"RIFF") && sig.get(8..12) == Some(b"WAVE") {
         Some("wav")
+    } else if sig.starts_with(b"RIFF") && sig.get(8..12) == Some(b"AVI ") {
+        Some("avi")
     } else if sig.starts_with(b"fLaC") {
         Some("flac")
     } else if sig.starts_with(b"OggS") {
@@ -127,7 +129,7 @@ pub fn inspect_local_file_with_probe(
             display_name: path
                 .file_name()
                 .and_then(|s| s.to_str())
-                .unwrap_or("audio")
+                .unwrap_or("media")
                 .to_owned(),
             kind: if details
                 .streams

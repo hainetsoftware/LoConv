@@ -19,6 +19,8 @@ wire_enum!(MediaKind {
 });
 wire_enum!(FormatId {
     Mp4H264Aac,
+    MkvH264Aac,
+    AviMpeg4Mp3,
     WebmVp9Opus,
     Mp3,
     WavPcm16,

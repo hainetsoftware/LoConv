@@ -27,6 +27,13 @@ interface AppProps {
   api?: DesktopApi;
 }
 
+function withOutputExtension(name: string, extension: string): string {
+  const separator = Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\'));
+  const dot = name.lastIndexOf('.');
+  const stem = dot > separator + 1 ? name.slice(0, dot) : name;
+  return `${stem}.${extension}`;
+}
+
 export const App: React.FC<AppProps> = ({ api: injectedApi }) => {
   const [api, setApi] = useState<DesktopApi | null>(() => injectedApi ?? null);
   const [apiVersion, setApiVersion] = useState<number | null>(null);
@@ -47,8 +54,7 @@ export const App: React.FC<AppProps> = ({ api: injectedApi }) => {
   const [destination, setDestination] = useState<DestinationSelection | null>(null);
   const [formats, setFormats] = useState<FormatDescriptor[]>([]);
   const [selectedFormatId, setSelectedFormatId] = useState<FormatId | null>(null);
-  const [outputName, setOutputName] = useState<string>('');
-  const [isOutputCustomized, setIsOutputCustomized] = useState(false);
+  const [outputNameEdit, setOutputNameEdit] = useState<{ name: string; formatId: FormatId | null } | null>(null);
 
   // Queue state: jobs map keyed by jobId
   const [jobs, setJobs] = useState<JobSnapshot[]>([]);
@@ -163,48 +169,31 @@ export const App: React.FC<AppProps> = ({ api: injectedApi }) => {
   }, [inputs, selectedMediaId]);
 
   const currentFormat = useMemo(() => {
-    return formats.find((f) => f.id === selectedFormatId) ?? null;
-  }, [formats, selectedFormatId]);
+    if (!selectedInput) return null;
+    const compatible = formats.filter((format) => format.available && format.inputKinds.includes(selectedInput.kind));
+    return compatible.find((format) => format.id === selectedFormatId) ?? compatible[0] ?? null;
+  }, [formats, selectedInput, selectedFormatId]);
 
-  // When selected input changes, auto-select a compatible format and suggest output filename
-  useEffect(() => {
-    if (!selectedInput) return;
+  let outputName = outputNameEdit?.name ?? '';
+  if (selectedInput && currentFormat) {
+    outputName = outputNameEdit?.formatId === currentFormat.id
+      ? outputNameEdit.name
+      : withOutputExtension(outputNameEdit?.name.trim() || selectedInput.displayName, currentFormat.extension);
+  }
 
-    // Pick first available format compatible with this input kind
-    const compatible = formats.filter(
-      (f) => f.inputKinds.includes(selectedInput.kind) && f.available,
-    );
-    const preferredFormat = compatible[0] ?? null;
-
-    if (preferredFormat && (!selectedFormatId || !formats.find((f) => f.id === selectedFormatId)?.inputKinds.includes(selectedInput.kind))) {
-      setSelectedFormatId(preferredFormat.id);
-    }
-
-    // Auto-suggest basename
-    if (!isOutputCustomized) {
-      const stem = selectedInput.displayName.replace(/\.[^/.]+$/, '');
-      const ext = preferredFormat?.extension ?? 'mp4';
-      setOutputName(`${stem}.${ext}`);
-    }
-  }, [selectedInput, formats, selectedFormatId, isOutputCustomized]);
-
-  // When format changes and outputName wasn't custom-typed, update extension
-  const handleSelectFormat = useCallback(
-    (formatId: FormatId) => {
-      setSelectedFormatId(formatId);
-      const fmt = formats.find((f) => f.id === formatId);
-      if (fmt && !isOutputCustomized && selectedInput) {
-        const stem = selectedInput.displayName.replace(/\.[^/.]+$/, '');
-        setOutputName(`${stem}.${fmt.extension}`);
-      }
-    },
-    [formats, isOutputCustomized, selectedInput],
-  );
+  const handleSelectFormat = useCallback((formatId: FormatId) => {
+    const format = formats.find((candidate) => candidate.id === formatId);
+    if (!format) return;
+    setSelectedFormatId(formatId);
+    setOutputNameEdit((edit) => {
+      const name = edit?.name.trim();
+      return name ? { name: withOutputExtension(name, format.extension), formatId } : null;
+    });
+  }, [formats]);
 
   const handleOutputNameChange = useCallback((name: string) => {
-    setOutputName(name);
-    setIsOutputCustomized(true);
-  }, []);
+    setOutputNameEdit({ name, formatId: currentFormat?.id ?? null });
+  }, [currentFormat]);
 
   // File selection handlers
   const handleSelectFiles = useCallback(async () => {
@@ -355,7 +344,7 @@ export const App: React.FC<AppProps> = ({ api: injectedApi }) => {
             <FormatSelector
               formats={formats}
               selectedInput={selectedInput}
-              selectedFormatId={selectedFormatId}
+              selectedFormatId={currentFormat?.id ?? null}
               onSelectFormatId={handleSelectFormat}
               outputName={outputName}
               onChangeOutputName={handleOutputNameChange}
